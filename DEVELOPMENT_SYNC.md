@@ -26,6 +26,7 @@ __init__.py
 LICENSE
 README.md
 DEVELOPMENT_SYNC.md
+GPT_Image插件本地修改记录.md
 .gitignore
 ```
 
@@ -103,6 +104,14 @@ DEVELOPMENT_SYNC.md
 
 ## 从运行机器同步到本仓库
 
+同步前先看：
+
+```text
+GPT_Image插件本地修改记录.md
+```
+
+后续本地改动以这个文件作为变更来源和核对清单。提交前需要确认记录里的改动已经体现在源码或 schema 中，并把“是否已同步到 Git”更新为已同步。
+
 先从运行机器复制当前容器内插件文件，避免宿主挂载权限或旧文件问题：
 
 ```powershell
@@ -169,7 +178,7 @@ ssh bot@<BOT_HOST> "docker logs --since 2m astrbot 2>&1 | grep -E 'astrbot_plugi
 
 ```bash
 git status --short
-git add main.py _conf_schema.json metadata.yaml __init__.py LICENSE README.md DEVELOPMENT_SYNC.md .gitignore
+git add main.py _conf_schema.json metadata.yaml __init__.py LICENSE README.md DEVELOPMENT_SYNC.md GPT_Image插件本地修改记录.md .gitignore
 git commit -m "Customize GPT Image plugin for AstrBot deployment"
 git push
 ```
