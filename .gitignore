@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.bak*
+.env
+.venv/
+venv/
+data/
+plugin_data/
+images/
+*.log
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+config.json
+*_config.json
+

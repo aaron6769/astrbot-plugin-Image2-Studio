@@ -1,0 +1,241 @@
+{
+  "api": {
+    "description": "API 接入设置",
+    "type": "object",
+    "hint": "兼容 OpenAI 官方 Images API、标准 OpenAI-compatible 接口，以及网页逆向/2api/ToAPIs 渠道。不确定供应商类型也可以直接填写，插件会自动选择合适的参数格式并在参数错误时切换重试。",
+    "items": {
+      "api_key": {
+        "description": "API Key",
+        "type": "string",
+        "default": "",
+        "hint": "供应商提供的 API Key。留空时按 OPENAI_API_KEY、TWO_API_KEY 环境变量回退读取。"
+      },
+      "base_url": {
+        "description": "Base URL",
+        "type": "string",
+        "default": "https://api.openai.com/v1",
+        "hint": "填到 /v1 即可，例如 https://api.openai.com/v1。插件会自动补 /images/generations 或 /images/edits。"
+      },
+      "model": {
+        "description": "模型名",
+        "type": "string",
+        "default": "gpt-image-2",
+        "hint": "按你的供应商要求填写，例如 gpt-image-2、gpt-image-2-all、gpt-image-1.5-official。"
+      },
+      "timeout_seconds": {
+        "description": "请求超时秒数",
+        "type": "int",
+        "default": 180,
+        "hint": "图像生成可能较慢，建议 120-300 秒。"
+      },
+      "user_agent": {
+        "description": "自定义 User-Agent",
+        "type": "string",
+        "default": "",
+        "hint": "留空使用插件默认 UA（避开 Cloudflare 默认拦截 Python/aiohttp 的规则）。如果你的中转要求特定 UA 才能访问，在这里覆盖；多数用户不用动。"
+      }
+    }
+  },
+  "image": {
+    "description": "图片参数",
+    "type": "object",
+    "hint": "size 是像素尺寸，resolution 是 1k/2k/4k 清晰度档位，aspect_ratio 是画面比例。命令或 LLM 工具里显式传参会覆盖默认值。",
+    "items": {
+      "size": {
+        "description": "默认像素尺寸",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "1024x1024", "1536x1024", "1024x1536"],
+        "hint": "宽x高像素。auto 表示不主动传 size；方图 1024x1024，横图 1536x1024，竖图 1024x1536。部分兼容站支持更多像素尺寸。"
+      },
+      "resolution": {
+        "description": "默认分辨率",
+        "type": "string",
+        "default": "1k",
+        "options": ["auto", "1k", "2k", "4k"],
+        "hint": "GPT 图像模型的清晰度档位。供应商支持时会生效；不支持时可能会忽略。"
+      },
+      "aspect_ratio": {
+        "description": "默认比例",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21"],
+        "hint": "画面比例。支持比例参数的兼容站会按比例出图；OpenAI 官方接口会近似映射为方图、横图或竖图。改图没传比例时优先跟随第一张参考图比例。"
+      },
+      "quality": {
+        "description": "默认质量",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "low", "medium", "high"],
+        "hint": "日常建议 auto。需要精细成品图时可选 high。"
+      },
+      "output_format": {
+        "description": "输出格式",
+        "type": "string",
+        "default": "png",
+        "options": ["png", "jpeg", "webp"],
+        "hint": "透明背景建议使用 png 或 webp。"
+      },
+      "background": {
+        "description": "背景",
+        "type": "string",
+        "default": "auto",
+        "options": ["auto", "transparent", "opaque"],
+        "hint": "transparent 用于透明背景。供应商如果不支持该字段，可能会忽略或报错。"
+      },
+      "max_reference_images": {
+        "description": "最多参考图数量",
+        "type": "int",
+        "default": 16,
+        "slider": {"min": 1, "max": 16, "step": 1},
+        "hint": "GPT 图像编辑接口最多支持 16 张参考图，插件会自动截断到这个上限。"
+      }
+    }
+  },
+  "prompt": {
+    "description": "提示词处理",
+    "type": "object",
+    "hint": "可选。给所有生成/改图请求统一追加提示词。",
+    "items": {
+      "prompt_prefix": {
+        "description": "统一前缀",
+        "type": "string",
+        "default": "",
+        "hint": "会放在用户提示词前面。"
+      },
+      "prompt_suffix": {
+        "description": "统一后缀",
+        "type": "string",
+        "default": "",
+        "hint": "会放在用户提示词后面。"
+      },
+      "negative_prompt": {
+        "description": "避免内容",
+        "type": "string",
+        "default": "",
+        "hint": "图像接口没有独立 negative prompt，本插件会把它追加成 Avoid: ...。"
+      }
+    }
+  },
+  "prompt_enhance": {
+    "description": "参考图提示词增强",
+    "type": "object",
+    "hint": "可选。占位符模式会使用“完整提示词增强模板”生成最终提示词，并要求增强模型把占位符替换为用户本次真实需求；如果模型遗留占位符，插件会用用户原始请求兜底替换。",
+    "items": {
+      "enable": {
+        "description": "启用提示词增强",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，插件会在真正提交图片生成/编辑前，先调用下面配置的模型生成最终提示词。"
+      },
+      "provider_id": {
+        "description": "提示词增强模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "填写一个支持视觉输入的模型 Provider ID，例如 grsai/gemini-3.1-pro。留空则使用当前默认对话模型。"
+      },
+      "mode": {
+        "description": "增强模式",
+        "type": "string",
+        "default": "placeholder",
+        "options": ["placeholder", "full_prompt"],
+        "hint": "placeholder：使用“完整提示词增强模板”，让增强模型把占位符替换为用户本次需求并输出最终提示词；full_prompt：直接让增强模型输出最终提示词，不做占位符兜底替换。"
+      },
+      "apply_to": {
+        "description": "应用范围",
+        "type": "string",
+        "default": "edit_only",
+        "options": ["edit_only", "all"],
+        "hint": "edit_only 只在有参考图的改图请求中启用；all 会对纯文字生图也调用模型改写提示词。"
+      },
+      "placeholder": {
+        "description": "主体内容占位符",
+        "type": "string",
+        "default": "[在此处替换为您想要生成的主体内容]",
+        "hint": "在“完整提示词增强模板”中预留的主体/目标描述位置。placeholder 模式下最终提交前不应再保留这个占位符。"
+      },
+      "final_prompt_template": {
+        "description": "固定绘图母版（旧版保留）",
+        "type": "string",
+        "default": "Edit the provided reference image. Treat the reference image as the image to modify, not just as style inspiration.\n\nReplace only the requested main subject/person/foreground character with:\n[在此处替换为您想要生成的主体内容]\n\nHard constraints:\n- Preserve the original composition, camera angle, framing, perspective, aspect ratio, background, lighting direction, atmosphere, depth of field, and overall layout as much as possible.\n- Keep all non-target objects, scenery, background figures, readable text, logos, signs, UI, and environmental details unchanged unless the user explicitly asks to change them.\n- If the reference image contains text and the user asks to keep text, keep the text clear, readable, and in the same approximate position.\n- Remove or transform the original target subject; do not leave the old subject visible as an extra character.\n- Do not add new watermarks, captions, random text, extra characters, or unrelated story elements.\n- The result should look like a local edit of the provided image rather than a completely new image.",
+        "hint": "旧版主体提取流程使用的固定母版。当前 placeholder 模式已改为使用“完整提示词增强模板”，这里保留是为了兼容旧配置。"
+      },
+      "subject_prompt_template": {
+        "description": "主体内容提取提示词（旧版保留）",
+        "type": "string",
+        "default": "你是图像编辑需求提取器。请根据用户原始消息、工具改写提示词和参考图片，提取一段应该填入固定绘图母版占位符里的“主体/目标内容”。\n\n用户原始消息：\n{raw_user_prompt}\n\n工具改写提示词：\n{user_prompt}\n\n工具传入的额外风格参数：\n{style}\n\n参考图片数量：\n{image_count}\n\n请遵守：\n1. 只输出要填入占位符的主体/目标描述，不要输出完整绘图提示词。\n2. 如果用户要求“替换/换成/改成某人物或主体”，重点描述新主体的身份、外观、服装、姿态、表情、风格和必须出现的标志性元素。\n3. 如果用户要求保留文字、保留构图、保留背景或保留姿势，请把这些和主体相关的硬要求简洁写入描述。\n4. 不要编造用户没有要求的新文字、logo、水印、剧情或额外角色。\n5. 不要解释，不要 Markdown，不要代码块。",
+        "hint": "旧版主体提取流程使用。当前 placeholder 模式不再读取这个字段，请把主控提示词写在“完整提示词增强模板”里。"
+      },
+      "prompt_template": {
+        "description": "完整提示词增强模板",
+        "type": "string",
+        "default": "你是图像生成提示词工程师。请根据用户需求和参考图片，输出一段适合 GPT Image 图像编辑/生成接口使用的最终提示词。\n\n用户原始需求：\n{user_prompt}\n\n工具传入的额外风格参数：\n{style}\n\n参考图片数量：\n{image_count}\n\n请遵守：\n1. 先准确理解参考图主体、构图、画面关系、颜色、材质、表情、动作和重要细节。\n2. 如果参考图中有文字，请逐字列出文字内容，并说明大概位置；用户要求保留文字时，必须在最终提示词里强调文字清晰可读、内容和位置尽量保持一致。\n3. 如果用户要求重绘、转画风或改图，请明确哪些元素需要保留，哪些元素需要改变。\n4. 把用户要求转写成完整、具体、可独立理解的图像提示词，适合直接提交给图片生成模型。\n5. 不要新增用户没有要求的主体、文字、logo、水印或剧情。\n6. 只输出最终提示词，不要解释，不要 Markdown，不要代码块。",
+        "hint": "placeholder 和 full_prompt 模式都会使用。placeholder 模式下，如果模板中包含占位符，增强模型会被要求把它替换为用户本次需求，并且插件会做兜底替换。可用变量：{raw_user_prompt} 用户原始消息，{user_prompt} 工具改写提示词，{style} 风格参数，{image_count} 参考图数量。"
+      },
+      "max_reference_images": {
+        "description": "增强模型最多读取参考图数",
+        "type": "int",
+        "default": 1,
+        "slider": {"min": 0, "max": 16, "step": 1},
+        "hint": "提示词增强阶段最多把多少张参考图发给视觉模型。0 表示只用文字需求改写，不发送图片。"
+      },
+      "timeout_seconds": {
+        "description": "增强模型超时秒数",
+        "type": "int",
+        "default": 60,
+        "hint": "提示词增强模型的请求超时时间。图片理解模型较慢时可调高。"
+      },
+      "max_output_chars": {
+        "description": "增强提示词最大字符数",
+        "type": "int",
+        "default": 4000,
+        "hint": "增强模型输出过长时会截断，避免提交给图片接口的 prompt 过大。"
+      },
+      "fallback_to_original_prompt": {
+        "description": "增强失败时回退原提示词",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，如果提示词增强模型失败，仍会用原始提示词继续生成；关闭则直接报错。"
+      }
+    }
+  },
+  "runtime": {
+    "description": "运行设置",
+    "type": "object",
+    "hint": "函数工具和工具说明默认启用；如需禁用工具，请在 AstrBot 自带的函数工具开关里关闭 generate_image_with_gpt_image_2。",
+    "items": {
+      "llm_tool_foreground_wait_seconds": {
+        "description": "LLM 工具前台等待秒数",
+        "type": "int",
+        "default": 0,
+        "hint": "0 表示工具立刻返回短句给模型，让模型按自己人设告诉用户；生成完成后自动发图。"
+      },
+      "max_concurrent": {
+        "description": "图片生成并行数",
+        "type": "int",
+        "default": 1,
+        "hint": "同一时间最多允许多少个图片请求同时跑。默认 1，后续任务会排队；调高会更吃接口额度和带宽。"
+      },
+      "retry_times": {
+        "description": "网络抖动重试次数",
+        "type": "int",
+        "default": 1,
+        "slider": {"min": 0, "max": 5, "step": 1},
+        "hint": "仅用于下载图片等无副作用请求。生成/改图是 POST 任务提交，为避免超时后重复生成或重复扣费，插件不会自动重试这类请求。"
+      },
+      "cache_ttl_hours": {
+        "description": "图片缓存保留小时数",
+        "type": "int",
+        "default": 72,
+        "hint": "生成图片会保存在插件数据目录，超过该时间会在下一次生成后清理。0 表示不按时间清理。"
+      },
+      "max_cache_files": {
+        "description": "最多缓存文件数",
+        "type": "int",
+        "default": 200,
+        "hint": "超过数量后删除最旧文件。0 表示不按数量清理。"
+      }
+    }
+  }
+}
