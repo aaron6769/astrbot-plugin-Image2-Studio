@@ -38,6 +38,7 @@ DEVELOPMENT_SYNC.md
 - `_group_message_mentions_this_bot`
 - `_message_chain_mentions_bot`
 - `DirectReferenceImageEditFilter.filter`
+- `DirectTextImageGenerationFilter.filter`
 - `generate_command`
 - `edit_command`
 - `generate_image_with_gpt_image_2`
@@ -48,6 +49,24 @@ DEVELOPMENT_SYNC.md
 2. 群聊必须检测到消息链里有 `At(qq=event.get_self_id())`。
 3. 未 @bot 的群消息不允许触发生图/改图。
 4. `@全体` 或 @其他人 不算。
+
+### 纯文字生图直通
+
+相关入口：
+
+- `DirectTextImageGenerationFilter`
+- `direct_text_image_generation_request`
+- `DIRECT_TEXT_GENERATION_PATTERNS`
+
+用途：
+
+群聊里用户已经 @bot，并且文本明确是“画一张、生成一张、来张、做一张”等纯文字生图请求时，插件直接启动图片生成任务，不再依赖对话模型自行决定是否调用 `generate_image_with_gpt_image_2`。
+
+注意：
+
+1. 群聊仍然必须 @bot。
+2. `/生图` 命令仍由命令处理器负责，直通入口会跳过 `/生图` 和 `/改图` 开头的文本。
+3. 如果消息里带图片或引用图片，交给参考图改图入口处理。
 
 ### 提示词增强 placeholder 模式
 

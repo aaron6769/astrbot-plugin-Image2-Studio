@@ -97,6 +97,27 @@ DIRECT_REFERENCE_GENERATION_PATTERNS = [
     r"(draw|generate|create|make|paint|design).*(reference|use|basedon|from).*(this|the)?(image|picture|photo)",
 ]
 
+DIRECT_TEXT_GENERATION_PATTERNS = [
+    r"(画|绘制|生成|生图|出图|出一张|做一张|做张|做一个|做个|来一张|来张).*(图|图片|图像|画|海报|头像|壁纸|图标|logo|贴纸|表情|插画|漫画|照片|场景|全身照)",
+    r"(再生成|重新生成|重生成|继续生成|生成).*(一遍|一次|安全|动漫|写实|风格|画风|版|图|图片|插画|场景)",
+    r"(再画|重新画).+",
+    r"(再来|重新来).*(一遍|一次|一张|张|图|图片|版|插画|场景)",
+    r"(画|绘制)(一张|一个|个|只|幅|张).+",
+    r"(生成|做|设计|制作)(一张|一个|个|张).+",
+    r"(帮我|给我|替我).*(画|绘制|生成|生图|出图|做一张|做张|做一个|做个|来一张|来张)",
+    r"(设计|制作|做).*(一张|一个|个).*(图|图片|图像|海报|头像|壁纸|图标|logo|贴纸|表情|插画|漫画)",
+    r"^(画|绘制|生成|生图|出图|做一张|做张|做一个|做个|来一张|来张)",
+    r"(draw|generate|create|make|paint|design).*(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration|comic|scene)",
+    r"(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration).*(draw|generate|create|make|paint|design)",
+    r"(can|could|please|pls|wouldyou|canyou|couldyou|helpme).*(draw|paint).+",
+    r"(can|could|please|pls|wouldyou|canyou|couldyou|helpme).*(generate|create|make|design).*(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration|comic|scene)",
+    r"^(draw|paint)(a|an|the)?.+",
+    r"^(draw|generate|create|make|paint|design)(an?|the)?(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration|comic|scene)",
+    r"(画像|イラスト|写真|ポスター|アイコン|壁紙|ロゴ).*(描いて|生成|作成|作って|描く)",
+    r"(描いて|生成|作成|作って).*(画像|イラスト|写真|ポスター|アイコン|壁紙|ロゴ)",
+    r"(描いて|描く|生成して|作って|作成して)",
+]
+
 
 def _safe_event_text(event: AstrMessageEvent) -> str:
     try:
@@ -121,6 +142,17 @@ def _direct_reference_text_allows_image_edit(text: str) -> bool:
         re.search(pattern, normalized)
         for pattern in DIRECT_REFERENCE_EDIT_PATTERNS + DIRECT_REFERENCE_GENERATION_PATTERNS
     )
+
+
+def _direct_text_allows_image_generation(text: str) -> bool:
+    normalized = _normalized_request_text(text)
+    if not normalized:
+        return False
+    if normalized.startswith(("/改图", "/生图")):
+        return False
+    if any(re.search(pattern, normalized) for pattern in DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS):
+        return False
+    return any(re.search(pattern, normalized) for pattern in DIRECT_TEXT_GENERATION_PATTERNS)
 
 
 def _message_chain_has_image_or_reply(chain: Any) -> bool:
@@ -205,6 +237,20 @@ class DirectReferenceImageEditFilter(filter.CustomFilter):
         except Exception:
             message_chain = getattr(getattr(event, "message_obj", None), "message", [])
         return _message_chain_has_image_or_reply(message_chain)
+
+
+class DirectTextImageGenerationFilter(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        if not _group_message_mentions_this_bot(event):
+            return False
+        if not _direct_text_allows_image_generation(_safe_event_text(event)):
+            return False
+        try:
+            message_chain = event.get_messages()
+        except Exception:
+            message_chain = getattr(getattr(event, "message_obj", None), "message", [])
+        return not _message_chain_has_image_or_reply(message_chain)
+
 
 OPENAI_SIZE_TO_RATIO = {
     "1024x1024": "1:1",
@@ -498,6 +544,71 @@ class GPTImage2Plugin(Star):
             )
         )
         self._schedule_background_delivery(event, task, error_prefix="图片修改失败")
+        event.stop_event()
+        yield event.plain_result(self._tool_submitted_message())
+
+    @filter.custom_filter(DirectTextImageGenerationFilter)
+    async def direct_text_image_generation_request(self, event: AstrMessageEvent):
+        prompt = self._event_text(event)
+        opts, prompt = self._parse_inline_options(prompt)
+        if not prompt:
+            return
+
+        turn_key = self._tool_turn_key(event)
+        turn_task = self._inflight_tool_turns.get(turn_key)
+        if turn_task and not turn_task.done():
+            event.stop_event()
+            yield event.plain_result(self._tool_submitted_message())
+            return
+        if turn_task and turn_task.done():
+            self._inflight_tool_turns.pop(turn_key, None)
+
+        request_key = self._tool_request_key(
+            event,
+            prompt=prompt,
+            size=opts.get("size"),
+            aspect_ratio=opts.get("aspect_ratio"),
+            resolution=opts.get("resolution"),
+            quality=opts.get("quality"),
+            style=opts.get("style"),
+            transparent_background=opts.get("transparent_background", False),
+            reference_paths=[],
+        )
+        existing_task = self._inflight_tool_tasks.get(request_key)
+        if existing_task and not existing_task.done():
+            event.stop_event()
+            yield event.plain_result(self._tool_submitted_message())
+            return
+        if existing_task and existing_task.done():
+            self._inflight_tool_tasks.pop(request_key, None)
+
+        task = asyncio.create_task(
+            self._generate_image(
+                prompt=prompt,
+                raw_user_prompt=prompt,
+                size=opts.get("size"),
+                aspect_ratio=opts.get("aspect_ratio"),
+                resolution=opts.get("resolution"),
+                quality=opts.get("quality"),
+                style=opts.get("style"),
+                transparent_background=opts.get("transparent_background", False),
+            )
+        )
+        self._inflight_tool_tasks[request_key] = task
+        self._inflight_tool_turns[turn_key] = task
+
+        def _clear_inflight(done_task: asyncio.Task[tuple[str, str | None]]) -> None:
+            if self._inflight_tool_tasks.get(request_key) is done_task:
+                self._inflight_tool_tasks.pop(request_key, None)
+            if self._inflight_tool_turns.get(turn_key) is done_task:
+                self._inflight_tool_turns.pop(turn_key, None)
+
+        task.add_done_callback(_clear_inflight)
+        logger.info(
+            "GPT Image direct text generation intercepted before LLM prompt_len=%d",
+            len(prompt),
+        )
+        self._schedule_background_delivery(event, task, error_prefix="图片生成失败")
         event.stop_event()
         yield event.plain_result(self._tool_submitted_message())
 
