@@ -114,6 +114,99 @@
         "type": "string",
         "default": "",
         "hint": "图像接口没有独立 negative prompt，本插件会把它追加成 Avoid: ...。"
+      },
+      "translate_to_english": {
+        "description": "上传前转英文",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，插件会在真正调用图片接口前，把最终提示词翻译/改写成英文再上传。中文增强模板仍可照常使用。"
+      },
+      "translation_provider_id": {
+        "description": "英文化模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "可选。留空时使用当前默认对话模型。建议选择稳定的文本对话模型，不需要视觉模型。"
+      },
+      "translation_template": {
+        "description": "英文化提示词模板",
+        "type": "string",
+        "default": "You are an image prompt localization and rewriting assistant.\n\nTask:\nRewrite the following final image prompt into clear, natural English suitable for an image generation model.\n\nFinal image prompt:\n{prompt}\n\nRequirements:\n1. Output only the final English image prompt. Do not explain, do not use Markdown, and do not wrap it in quotes.\n2. Preserve every concrete visual requirement, composition constraint, style, subject identity, clothing, expression, pose, background, lighting, and negative constraint.\n3. If the prompt asks the image to contain specific visible text, keep that visible text exactly in its original language and make it clear that the text should appear in the image.\n4. Do not add new characters, logos, watermarks, captions, or story elements.\n5. Keep safety and modesty constraints explicit if they are present.",
+        "hint": "可用变量：{prompt} 表示插件已经整理完成、即将上传给图片接口的最终提示词。"
+      },
+      "translation_timeout_seconds": {
+        "description": "英文化超时秒数",
+        "type": "int",
+        "default": 45,
+        "hint": "提示词英文化阶段的模型请求超时。"
+      },
+      "translation_max_output_chars": {
+        "description": "英文提示词最大字符数",
+        "type": "int",
+        "default": 4000,
+        "hint": "英文提示词过长时会截断，避免提交给图片接口的 prompt 过大。"
+      },
+      "translation_fallback_to_original": {
+        "description": "英文化失败时回退原文",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭时，英文化失败会直接报错，不会把中文 prompt 上传给图片接口；开启时会继续使用原提示词。"
+      }
+    }
+  },
+  "self_persona": {
+    "description": "自拍/人设生图",
+    "type": "object",
+    "hint": "识别到“你、你的、自己、自拍、全身照、本体、形象”等纯文字生图请求时，优先使用这里配置的生图人设生成最终提示词。适合固定 bot 的自拍和形象图，不受 AstrBot 对话人设改动影响。",
+    "items": {
+      "enable": {
+        "description": "启用插件内生图人设",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，自拍/本体/你的形象这类请求会使用插件内人设改写提示词。"
+      },
+      "provider_id": {
+        "description": "人设提示词改写模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "可选。留空则使用当前会话默认对话模型；填写后会使用指定 Provider ID 来把插件内人设和用户请求改写成最终图像提示词。"
+      },
+      "persona_name": {
+        "description": "生图人设名称",
+        "type": "string",
+        "default": "",
+        "hint": "例如 Neuro-sama、工具人、看板娘等。留空但填写了视觉设定时，会使用“插件内生图人设”。"
+      },
+      "persona_prompt": {
+        "description": "生图人设/视觉设定",
+        "type": "string",
+        "default": "",
+        "hint": "固定自拍和本体形象的核心配置。建议写清楚发色、瞳色、服装、年龄感、气质、常见场景、禁止出现的元素等。"
+      },
+      "fallback_to_astrbot_persona": {
+        "description": "未填写时回退 AstrBot 人设",
+        "type": "bool",
+        "default": true,
+        "hint": "插件内人设名称和视觉设定都为空时，是否继续使用当前 AstrBot 对话人设。关闭后会只按用户请求做通用视觉化。"
+      },
+      "prompt_template": {
+        "description": "人设提示词改写模板",
+        "type": "string",
+        "default": "你是图像生成提示词改写器。用户正在让当前 bot 根据插件内配置的人设生成图像。\n\n插件内人设名称：\n{persona_name}\n\n插件内人设/视觉设定：\n{persona_prompt}\n\n用户原始生图请求：\n{user_prompt}\n\n请把用户请求改写成一段可以直接提交给图像生成模型的中文提示词。\n\n要求：\n1. 必须根据“插件内人设/视觉设定”提炼 bot 的可视化形象、气质、服装、表情、姿态和画面氛围。\n2. 如果用户说“你、你的、自己、自拍、全身照、本体、形象”等，指的就是插件内配置的 bot 形象。\n3. 保留用户请求里的画幅、视角、动作、风格、数量和限制。\n4. 如果人设没有明确外貌，请根据设定气质做合理视觉化，但不要加入无关角色、文字、logo、水印或剧情。\n5. 只输出最终图像提示词，不要解释，不要 Markdown，不要代码块。",
+        "hint": "可用变量：{persona_name} 生图人设名称，{persona_prompt} 生图人设/视觉设定，{user_prompt} 用户原始生图请求。"
+      },
+      "timeout_seconds": {
+        "description": "改写模型超时秒数",
+        "type": "int",
+        "default": 45,
+        "hint": "自拍/人设生图提示词改写阶段的请求超时。留意这不是图像生成接口超时。"
+      },
+      "max_output_chars": {
+        "description": "人设提示词最大字符数",
+        "type": "int",
+        "default": 4000,
+        "hint": "改写模型输出过长时会截断，避免提交给图片接口的 prompt 过大。"
       }
     }
   },
@@ -223,6 +316,12 @@
         "default": 1,
         "slider": {"min": 0, "max": 5, "step": 1},
         "hint": "仅用于下载图片等无副作用请求。生成/改图是 POST 任务提交，为避免超时后重复生成或重复扣费，插件不会自动重试这类请求。"
+      },
+      "recent_reference_ttl_seconds": {
+        "description": "最近参考图有效秒数",
+        "type": "int",
+        "default": 180,
+        "hint": "用户先单独发图、再发送“重绘成...”这类改图文字时，插件会在同一会话内沿用最近一张参考图。0 表示关闭。群聊仍必须 @bot 才会触发。"
       },
       "cache_ttl_hours": {
         "description": "图片缓存保留小时数",

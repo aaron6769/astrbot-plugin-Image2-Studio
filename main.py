@@ -27,9 +27,9 @@ from typing import Any
 
 import aiohttp
 
-from astrbot.api import llm_tool, logger
+from astrbot.api import llm_tool, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Reply
+from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import Provider, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
@@ -72,6 +72,9 @@ TRANSIENT_HTTP_STATUSES = {408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525
 NETWORK_RETRY_BASE_DELAY_SECONDS = 1.5
 
 DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS = [
+    r"(翻译|译成|翻成|翻译成|translate|translation).*(中文|英文|日文|日语|韩文|韩语|法文|德文|俄文|to|into)",
+    r"(这段话|这段|这句话|这句|这段文字|这段英文|这段日文|这段prompt|thistext|thissentence).*(翻译|译成|翻成|translate)",
+    r"^(翻译|译成|翻成|translate).+",
     r"(提示词|prompt).*(写|改|优化|润色|翻译|扩写|整理)",
     r"(生成|写|改|优化|润色|翻译|扩写|整理).*(提示词|prompt)",
     r"(怎么|如何|为什么|什么|啥|能不能|可以吗|参数|设置|教程|建议|方案|分析|评价).*(画|生成|生图|出图|改图|图片|图像)",
@@ -84,6 +87,8 @@ DIRECT_REFERENCE_EDIT_PATTERNS = [
     r"(改图|修图|p图|重绘|重画|重新画|扩图|扩展|延展|外扩|补图|补全|补完|补齐|抠图)",
     r"(重画|重绘|重新画|改画|转绘|改成|改为|变成|变为|转成|转为|做成).*(风格|画风|材质|质感|效果|样子|手办|动漫|写实|3d|像素|水彩|油画|产品渲染)",
     r"(改|修|换|替换|去掉|删除|加上|添加|合成|参考|照着|补全|补完|补齐|扩展|延展|外扩).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照)",
+    r"(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
+    r"(给|帮|帮我|请).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
     r"(把|将).*(图|图片|照片|背景|主体|人物|文字).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|变成|变为|转成|做成)",
     r"(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|outpaint|cutout).*(this|the)?(image|picture|photo|background|subject|person|text)",
     r"(this|the)?(image|picture|photo|background|subject|person|text).*(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|outpaint|cutout)",
@@ -116,6 +121,22 @@ DIRECT_TEXT_GENERATION_PATTERNS = [
     r"(画像|イラスト|写真|ポスター|アイコン|壁紙|ロゴ).*(描いて|生成|作成|作って|描く)",
     r"(描いて|生成|作成|作って).*(画像|イラスト|写真|ポスター|アイコン|壁紙|ロゴ)",
     r"(描いて|描く|生成して|作って|作成して)",
+]
+
+DESCRIPTION_REFERENCE_GENERATION_PATTERNS = [
+    r"(按|按照|根据|基于|用|依照).*(这张图|这张图片|这个图|这个图片|这张|这个|上图|引用|图里|图中|图片里|图片中).*(描述|文字|文案|内容|提示词|prompt).*(画|绘制|生成|生一张|生张|生个|生图|出图|做|设计)",
+    r"(画|绘制|生成|生一张|生张|生个|生图|出图|做|设计).*(按|按照|根据|基于|用|依照).*(这张图|这张图片|这个图|这个图片|这张|这个|上图|引用|图里|图中|图片里|图片中).*(描述|文字|文案|内容|提示词|prompt)",
+    r"(按|按照|根据|基于|用|依照).*(这个|这段|上面|引用|图里|图中|图片里|图片中).*(描述|文字|文案|内容|提示词|prompt).*(画|绘制|生成|生图|出图|做|设计)",
+    r"(画|绘制|生成|生图|出图|做|设计).*(按|按照|根据|基于|用|依照).*(这个|这段|上面|引用|图里|图中|图片里|图片中).*(描述|文字|文案|内容|提示词|prompt)",
+    r"(按|按照|根据|基于|用|依照).*(描述|文字|文案|内容|提示词|prompt).*(画|绘制|生成|生一张|生张|生个|生图|出图|做|设计).*(图|图片|图像|画|插画|场景)",
+    r"(read|ocr|extract).*(text|description|prompt).*(image|picture|photo).*(draw|generate|create|make)",
+    r"(draw|generate|create|make).*(from|basedon|accordingto).*(text|description|prompt).*(image|picture|photo)",
+]
+
+PERSONA_REFERENTIAL_TEXT_PATTERNS = [
+    r"(你|妳|你的|妳的|你自己|妳自己|自己|本体|本人|人设|人格|设定|形象|自拍|自画像)",
+    r"(yourself|yourselfie|selfie|yourpersona|yourcharacter|youravatar|yourfullbody|yourown)",
+    r"(君|あなた|自分|本人|人格|設定|自撮り)",
 ]
 
 
@@ -155,6 +176,22 @@ def _direct_text_allows_image_generation(text: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in DIRECT_TEXT_GENERATION_PATTERNS)
 
 
+def _description_reference_text_allows_image_generation(text: str) -> bool:
+    normalized = _normalized_request_text(text)
+    if not normalized:
+        return False
+    if any(re.search(pattern, normalized) for pattern in DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS):
+        return False
+    return any(re.search(pattern, normalized) for pattern in DESCRIPTION_REFERENCE_GENERATION_PATTERNS)
+
+
+def _text_generation_needs_persona(text: str) -> bool:
+    normalized = _normalized_request_text(text)
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized) for pattern in PERSONA_REFERENTIAL_TEXT_PATTERNS)
+
+
 def _message_chain_has_image_or_reply(chain: Any) -> bool:
     if isinstance(chain, Image):
         return True
@@ -176,6 +213,29 @@ def _message_chain_has_image_or_reply(chain: Any) -> bool:
         if nested_nodes:
             for node in nested_nodes:
                 if _message_chain_has_image_or_reply(getattr(node, "content", None)):
+                    return True
+    return False
+
+
+def _message_chain_has_image(chain: Any) -> bool:
+    if isinstance(chain, Image):
+        return True
+    if not isinstance(chain, (list, tuple)):
+        return False
+
+    for component in chain:
+        if isinstance(component, Image):
+            return True
+        nested_chain = getattr(component, "chain", None)
+        if nested_chain and _message_chain_has_image(nested_chain):
+            return True
+        nested_content = getattr(component, "content", None)
+        if nested_content and _message_chain_has_image(nested_content):
+            return True
+        nested_nodes = getattr(component, "nodes", None)
+        if nested_nodes:
+            for node in nested_nodes:
+                if _message_chain_has_image(getattr(node, "content", None)):
                     return True
     return False
 
@@ -232,24 +292,25 @@ class DirectReferenceImageEditFilter(filter.CustomFilter):
             return False
         if not _direct_reference_text_allows_image_edit(_safe_event_text(event)):
             return False
-        try:
-            message_chain = event.get_messages()
-        except Exception:
-            message_chain = getattr(getattr(event, "message_obj", None), "message", [])
-        return _message_chain_has_image_or_reply(message_chain)
+        return True
 
 
 class DirectTextImageGenerationFilter(filter.CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
         if not _group_message_mentions_this_bot(event):
             return False
-        if not _direct_text_allows_image_generation(_safe_event_text(event)):
+        text = _safe_event_text(event)
+        text_allows_generation = _direct_text_allows_image_generation(text)
+        text_allows_description_reference = _description_reference_text_allows_image_generation(text)
+        if not (text_allows_generation or text_allows_description_reference):
             return False
         try:
             message_chain = event.get_messages()
         except Exception:
             message_chain = getattr(getattr(event, "message_obj", None), "message", [])
-        return not _message_chain_has_image_or_reply(message_chain)
+        if _message_chain_has_image_or_reply(message_chain):
+            return text_allows_description_reference
+        return text_allows_generation or text_allows_description_reference
 
 
 OPENAI_SIZE_TO_RATIO = {
@@ -451,6 +512,45 @@ Hard constraints:
 - The result should look like a local edit of the provided image rather than a completely new image.
 """.strip()
 
+DEFAULT_SELF_PERSONA_REWRITE_TEMPLATE = """
+你是图像生成提示词改写器。用户正在让当前 bot 根据插件内配置的人设生成图像。
+
+插件内人设名称：
+{persona_name}
+
+插件内人设/视觉设定：
+{persona_prompt}
+
+用户原始生图请求：
+{user_prompt}
+
+请把用户请求改写成一段可以直接提交给图像生成模型的中文提示词。
+
+要求：
+1. 必须根据“插件内人设/视觉设定”提炼 bot 的可视化形象、气质、服装、表情、姿态和画面氛围。
+2. 如果用户说“你、你的、自己、自拍、全身照、本体、形象”等，指的就是插件内配置的 bot 形象。
+3. 保留用户请求里的画幅、视角、动作、风格、数量和限制。
+4. 如果人设没有明确外貌，请根据设定气质做合理视觉化，但不要加入无关角色、文字、logo、水印或剧情。
+5. 只输出最终图像提示词，不要解释，不要 Markdown，不要代码块。
+""".strip()
+
+DEFAULT_PROMPT_TRANSLATION_TEMPLATE = """
+You are an image prompt localization and rewriting assistant.
+
+Task:
+Rewrite the following final image prompt into clear, natural English suitable for an image generation model.
+
+Final image prompt:
+{prompt}
+
+Requirements:
+1. Output only the final English image prompt. Do not explain, do not use Markdown, and do not wrap it in quotes.
+2. Preserve every concrete visual requirement, composition constraint, style, subject identity, clothing, expression, pose, background, lighting, and negative constraint.
+3. If the prompt asks the image to contain specific visible text, keep that visible text exactly in its original language and make it clear that the text should appear in the image.
+4. Do not add new characters, logos, watermarks, captions, or story elements.
+5. Keep safety and modesty constraints explicit if they are present.
+""".strip()
+
 
 @register(
     PLUGIN_ID,
@@ -471,6 +571,7 @@ class GPTImage2Plugin(Star):
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._inflight_tool_tasks: dict[str, asyncio.Task[tuple[str, str | None]]] = {}
         self._inflight_tool_turns: dict[str, asyncio.Task[tuple[str, str | None]]] = {}
+        self._recent_reference_images: dict[str, tuple[float, list[str]]] = {}
         # In-memory cache of the compat profile that succeeded last time for a
         # given (base_url, model, operation). Lets the next request skip the
         # auto-detect heuristic and the failure-retry roundtrip.
@@ -494,9 +595,10 @@ class GPTImage2Plugin(Star):
             ).stop_event()
             return
 
+        image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
         task = asyncio.create_task(
             self._generate_image(
-                prompt=prompt,
+                prompt=image_prompt,
                 raw_user_prompt=prompt,
                 size=opts.get("size"),
                 aspect_ratio=opts.get("aspect_ratio"),
@@ -553,6 +655,34 @@ class GPTImage2Plugin(Star):
         opts, prompt = self._parse_inline_options(prompt)
         if not prompt:
             return
+        description_reference_paths: list[str] = []
+        description_reference_texts: list[str] = []
+        if _description_reference_text_allows_image_generation(prompt):
+            description_reference_paths = await self._collect_reference_image_paths(event)
+            description_reference_texts = self._collect_reference_description_texts(event)
+
+        if description_reference_paths or description_reference_texts:
+            try:
+                image_prompt = await self._enhance_prompt_from_description_reference(
+                    prompt=prompt,
+                    reference_image_paths=description_reference_paths,
+                    reference_texts=description_reference_texts,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GPT Image description reference prompt enhancement failed: %s",
+                    self._friendly_error(exc),
+                    exc_info=True,
+                )
+                event.stop_event()
+                yield event.plain_result(f"读取图片/引用里的描述失败：{self._friendly_error(exc)}")
+                return
+        elif _description_reference_text_allows_image_generation(prompt):
+            event.stop_event()
+            yield event.plain_result("没有找到可用的引用图片或引用文字。请引用包含描述文字的图片后再说“按这个描述生成一张图”。")
+            return
+        else:
+            image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
 
         turn_key = self._tool_turn_key(event)
         turn_task = self._inflight_tool_turns.get(turn_key)
@@ -565,7 +695,7 @@ class GPTImage2Plugin(Star):
 
         request_key = self._tool_request_key(
             event,
-            prompt=prompt,
+            prompt=image_prompt,
             size=opts.get("size"),
             aspect_ratio=opts.get("aspect_ratio"),
             resolution=opts.get("resolution"),
@@ -584,7 +714,7 @@ class GPTImage2Plugin(Star):
 
         task = asyncio.create_task(
             self._generate_image(
-                prompt=prompt,
+                prompt=image_prompt,
                 raw_user_prompt=prompt,
                 size=opts.get("size"),
                 aspect_ratio=opts.get("aspect_ratio"),
@@ -605,12 +735,25 @@ class GPTImage2Plugin(Star):
 
         task.add_done_callback(_clear_inflight)
         logger.info(
-            "GPT Image direct text generation intercepted before LLM prompt_len=%d",
+            "GPT Image direct text generation intercepted before LLM prompt_len=%d final_prompt_len=%d persona=%s",
             len(prompt),
+            len(image_prompt),
+            _text_generation_needs_persona(prompt),
         )
         self._schedule_background_delivery(event, task, error_prefix="图片生成失败")
         event.stop_event()
         yield event.plain_result(self._tool_submitted_message())
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=9500)
+    async def remember_recent_reference_images(self, event: AstrMessageEvent) -> None:
+        try:
+            paths = await self._collect_reference_image_paths(event, include_recent=False)
+        except Exception:
+            logger.debug("GPT Image failed to cache recent reference images", exc_info=True)
+            return
+        if paths:
+            self._remember_recent_reference_images(event, paths)
 
     @filter.custom_filter(DirectReferenceImageEditFilter)
     async def direct_reference_image_edit_request(self, event: AstrMessageEvent):
@@ -773,9 +916,13 @@ class GPTImage2Plugin(Star):
         if turn_task and turn_task.done():
             self._inflight_tool_turns.pop(turn_key, None)
 
+        image_prompt = prompt
+        if not reference_paths:
+            image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
+
         request_key = self._tool_request_key(
             event,
-            prompt=prompt,
+            prompt=image_prompt,
             size=size,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
@@ -793,7 +940,7 @@ class GPTImage2Plugin(Star):
         wait_seconds = max(0, self._int_cfg("runtime", "llm_tool_foreground_wait_seconds", 0))
         task = asyncio.create_task(
             self._generate_image(
-                prompt=prompt,
+                prompt=image_prompt,
                 raw_user_prompt=self._event_text(event) or prompt,
                 size=size,
                 aspect_ratio=aspect_ratio,
@@ -893,6 +1040,18 @@ class GPTImage2Plugin(Star):
                 else:
                     raise RuntimeError(f"提示词增强失败：{self._friendly_error(exc)}") from exc
         final_prompt = self._build_prompt(prompt_for_image, style_for_prompt)
+        if self._bool_cfg("prompt", "translate_to_english", False):
+            try:
+                final_prompt = await self._translate_prompt_to_english(final_prompt)
+            except Exception as exc:
+                if self._bool_cfg("prompt", "translation_fallback_to_original", False):
+                    logger.warning(
+                        "GPT Image prompt English translation failed; fallback to original prompt: %s",
+                        self._friendly_error(exc),
+                        exc_info=True,
+                    )
+                else:
+                    raise RuntimeError(f"提示词英文化失败：{self._friendly_error(exc)}") from exc
 
         operation = "edit" if references else "generation"
         base_url = self._base_url()
@@ -1358,6 +1517,315 @@ class GPTImage2Plugin(Star):
             return False
         return True
 
+    async def _persona_aware_text_generation_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
+        if not _text_generation_needs_persona(prompt):
+            return prompt
+
+        persona_name, persona_prompt, persona_source = await self._resolve_image_persona_mask(event)
+        fallback_prompt = self._fallback_persona_image_prompt(prompt, persona_name, persona_prompt)
+        provider = self._self_persona_provider(event)
+        if not provider:
+            logger.warning("GPT Image persona prompt rewrite skipped: no dialog provider available")
+            return fallback_prompt
+
+        rewrite_prompt = self._render_self_persona_template(
+            self._str_cfg("self_persona", "prompt_template", "")
+            or DEFAULT_SELF_PERSONA_REWRITE_TEMPLATE,
+            persona_name=persona_name,
+            persona_prompt=persona_prompt,
+            user_prompt=prompt,
+        )
+        try:
+            timeout = max(
+                5,
+                self._int_cfg(
+                    "self_persona",
+                    "timeout_seconds",
+                    self._int_cfg("prompt_enhance", "timeout_seconds", 45),
+                ),
+            )
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=rewrite_prompt,
+                    session_id=f"gpt-image-persona-prompt-{uuid.uuid4().hex}",
+                    persist=False,
+                ),
+                timeout=timeout,
+            )
+            rewritten = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
+            if rewritten:
+                max_chars = max(200, self._int_cfg("prompt_enhance", "max_output_chars", 4000))
+                max_chars = max(
+                    200,
+                    self._int_cfg("self_persona", "max_output_chars", max_chars),
+                )
+                logger.info(
+                    "GPT Image persona prompt rewrite done provider=%s persona=%s source=%s raw_len=%d rewritten_len=%d",
+                    self._provider_label(provider),
+                    persona_name,
+                    persona_source,
+                    len(prompt),
+                    len(rewritten),
+                )
+                return rewritten[:max_chars].rstrip()
+        except Exception as exc:
+            logger.warning("GPT Image persona prompt rewrite failed, using fallback prompt: %s", exc)
+        return fallback_prompt
+
+    def _fallback_persona_image_prompt(self, prompt: str, persona_name: str, persona_prompt: str) -> str:
+        return f"""
+根据当前 bot 生图人设生成图像。
+
+生图人设名称：{persona_name}
+
+生图人设/视觉设定：
+{persona_prompt}
+
+用户生图请求：
+{prompt}
+
+请将“你/你的/自己/自拍/本体/形象”等指代理解为上述 bot 生图人设的可视化形象。生成一张符合人设、用户请求和画面语境的图像，不要添加无关文字、logo、水印或额外角色。
+""".strip()
+
+    async def _resolve_image_persona_mask(self, event: AstrMessageEvent) -> tuple[str, str, str]:
+        if self._bool_cfg("self_persona", "enable", True):
+            configured_name = self._str_cfg("self_persona", "persona_name", "")
+            configured_prompt = self._str_cfg("self_persona", "persona_prompt", "")
+            if configured_name or configured_prompt:
+                return (
+                    configured_name or "插件内生图人设",
+                    configured_prompt or "根据人设名称做合理视觉化。",
+                    "plugin",
+                )
+            if not self._bool_cfg("self_persona", "fallback_to_astrbot_persona", True):
+                return "插件内生图人设", "根据用户请求做合理视觉化。", "plugin-empty"
+
+        persona_name, persona_prompt = await self._resolve_persona_mask(event)
+        return persona_name, persona_prompt, "astrbot"
+
+    def _self_persona_provider(self, event: AstrMessageEvent) -> Provider | None:
+        provider_id = self._str_cfg("self_persona", "provider_id", "")
+        if provider_id:
+            try:
+                provider = self.context.get_provider_by_id(provider_id)
+            except Exception as exc:
+                logger.warning("GPT Image self persona provider lookup failed: %s", exc)
+                provider = None
+            if isinstance(provider, Provider):
+                return provider
+            logger.warning(
+                "GPT Image self persona provider %r unavailable; fallback to dialog provider",
+                provider_id,
+            )
+        return self._event_dialog_provider(event)
+
+    def _render_self_persona_template(self, template: str, **values: str) -> str:
+        rendered = template
+        for key, value in values.items():
+            rendered = rendered.replace("{" + key + "}", value or "")
+        if "{user_prompt}" not in template:
+            rendered = f"{rendered.strip()}\n\n用户原始生图请求：\n{values.get('user_prompt', '')}"
+        if "{persona_prompt}" not in template:
+            rendered = (
+                f"{rendered.strip()}\n\n插件内人设/视觉设定：\n"
+                f"{values.get('persona_prompt', '')}"
+            )
+        return rendered.strip()
+
+    def _event_dialog_provider(self, event: AstrMessageEvent) -> Provider | None:
+        provider = None
+        try:
+            provider = self.context.get_using_provider(event.unified_msg_origin)
+        except Exception:
+            provider = None
+        if not provider:
+            try:
+                provider = self.context.get_using_provider()
+            except Exception:
+                provider = None
+        return provider if isinstance(provider, Provider) else None
+
+    async def _resolve_persona_mask(self, event: AstrMessageEvent) -> tuple[str, str]:
+        persona_id = ""
+        try:
+            session_service_config = await sp.get_async(
+                scope="umo",
+                scope_id=event.unified_msg_origin,
+                key="session_service_config",
+                default={},
+            )
+            if isinstance(session_service_config, dict):
+                persona_id = str(session_service_config.get("persona_id") or "").strip()
+        except Exception as exc:
+            logger.debug("GPT Image failed to read session persona: %s", exc)
+
+        if not persona_id:
+            try:
+                curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
+                    event.unified_msg_origin,
+                )
+                if curr_cid:
+                    conv = await self.context.conversation_manager.get_conversation(
+                        event.unified_msg_origin,
+                        curr_cid,
+                    )
+                    if conv and conv.persona_id:
+                        persona_id = str(conv.persona_id).strip()
+            except Exception as exc:
+                logger.debug("GPT Image failed to read conversation persona: %s", exc)
+
+        if not persona_id:
+            try:
+                cfg = self.context.get_config(umo=event.unified_msg_origin)
+                persona_id = str(
+                    cfg.get("provider_settings", {}).get("default_personality") or ""
+                ).strip()
+            except Exception as exc:
+                logger.debug("GPT Image failed to read default persona config: %s", exc)
+
+        if persona_id == "[%None]":
+            return "none", "No persona mask."
+
+        persona = None
+        if persona_id:
+            try:
+                persona = next(
+                    (
+                        p
+                        for p in self.context.persona_manager.personas_v3
+                        if p.get("name") == persona_id
+                    ),
+                    None,
+                )
+            except Exception:
+                persona = None
+
+        if not persona:
+            try:
+                persona = await self.context.persona_manager.get_default_persona_v3(
+                    event.unified_msg_origin,
+                )
+            except Exception:
+                persona = {"name": "default", "prompt": ""}
+
+        persona_name = str(persona.get("name") or "default")
+        persona_prompt = str(persona.get("prompt") or "").strip()
+        if not persona_prompt:
+            persona_prompt = "You are a helpful and friendly assistant."
+        return persona_name, persona_prompt
+
+    def _collect_reference_description_texts(self, event: AstrMessageEvent) -> list[str]:
+        texts: list[str] = []
+
+        def add_text(value: Any) -> None:
+            text = str(value or "").strip()
+            if text and text not in texts:
+                texts.append(text)
+
+        def walk_reply(component: Any) -> None:
+            if isinstance(component, Reply):
+                add_text(getattr(component, "message_str", ""))
+                add_text(getattr(component, "text", ""))
+                walk_chain(getattr(component, "chain", None))
+
+        def walk_chain(chain: Any) -> None:
+            if isinstance(chain, Plain):
+                add_text(getattr(chain, "text", ""))
+                return
+            if isinstance(chain, Reply):
+                walk_reply(chain)
+                return
+            if not isinstance(chain, (list, tuple)):
+                return
+
+            for component in chain:
+                if isinstance(component, Reply):
+                    walk_reply(component)
+                    continue
+                nested_chain = getattr(component, "chain", None)
+                if nested_chain:
+                    walk_chain(nested_chain)
+                nested_content = getattr(component, "content", None)
+                if nested_content:
+                    walk_chain(nested_content)
+                nested_nodes = getattr(component, "nodes", None)
+                if nested_nodes:
+                    for node in nested_nodes:
+                        walk_chain(getattr(node, "content", None))
+
+        try:
+            message_chain = event.get_messages()
+        except Exception:
+            logger.debug("Failed to read AstrBot message chain for quoted text", exc_info=True)
+            message_chain = getattr(getattr(event, "message_obj", None), "message", [])
+        walk_chain(message_chain)
+        return texts
+
+    async def _enhance_prompt_from_description_reference(
+        self,
+        *,
+        prompt: str,
+        reference_image_paths: list[str],
+        reference_texts: list[str],
+    ) -> str:
+        provider = self._prompt_enhance_provider()
+        if not provider:
+            raise RuntimeError("没有可用的提示词增强模型提供商")
+
+        max_images = max(0, self._int_cfg("prompt_enhance", "max_reference_images", 1))
+        image_urls = reference_image_paths[:max_images] if max_images else []
+        reference_text = "\n\n".join(text.strip() for text in reference_texts if text.strip())
+        enhancer_prompt = f"""
+你是图像生成提示词工程师。用户引用/发送了一张可能包含文字描述的图片，或引用了一段文字，并要求“按这个描述生成一张图”。
+
+用户原始需求：
+{prompt}
+
+引用消息文字（如果有）：
+{reference_text or "无"}
+
+参考图片数量：
+{len(image_urls)}
+
+请遵守：
+1. 如果参考图片里有文字，先准确识别图片中的文字内容，并把它作为主要图像描述来源。
+2. 如果引用消息文字不为空，也把引用文字作为主要图像描述来源。
+3. 这是纯文字生图任务，不是改图任务；不要要求保留参考图片的构图、背景、人物或画风，除非图片内文字本身这么要求。
+4. 把识别到的描述整理成一段完整、具体、可直接提交给图像生成模型的最终提示词。
+5. 不要新增无关文字、logo、水印或额外角色。
+6. 只输出最终图像提示词，不要解释，不要 Markdown，不要代码块。
+""".strip()
+        timeout = max(5, self._int_cfg("prompt_enhance", "timeout_seconds", 60))
+        logger.info(
+            "GPT Image description reference prompt enhancement start provider=%s images=%d quoted_text_len=%d timeout=%s",
+            self._provider_label(provider),
+            len(image_urls),
+            len(reference_text),
+            timeout,
+        )
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=enhancer_prompt,
+                session_id=f"gpt-image-description-reference-{uuid.uuid4().hex}",
+                image_urls=image_urls,
+                persist=False,
+            ),
+            timeout=timeout,
+        )
+        enhanced = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
+        if not enhanced:
+            raise RuntimeError("提示词增强模型没有返回有效内容")
+
+        max_chars = max(200, self._int_cfg("prompt_enhance", "max_output_chars", 4000))
+        enhanced = enhanced[:max_chars].rstrip()
+        logger.info(
+            "GPT Image description reference prompt enhancement done provider=%s images=%d output_len=%d",
+            self._provider_label(provider),
+            len(image_urls),
+            len(enhanced),
+        )
+        return enhanced
+
     async def _enhance_prompt_with_reference_images(
         self,
         *,
@@ -1461,6 +1929,58 @@ class GPTImage2Plugin(Star):
         if not isinstance(provider, Provider):
             raise RuntimeError(f"提示词增强模型提供商类型错误：{type(provider)}")
         return provider
+
+    def _prompt_translation_provider(self) -> Provider | None:
+        provider_id = self._str_cfg("prompt", "translation_provider_id", "")
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if not provider:
+                raise RuntimeError(f"没有找到 ID 为 {provider_id} 的提示词英文化模型提供商")
+        else:
+            provider = self.context.get_using_provider()
+            if not provider:
+                raise RuntimeError("当前默认模型提供商不可用，且未配置提示词英文化模型 provider_id")
+
+        if not isinstance(provider, Provider):
+            raise RuntimeError(f"提示词英文化模型提供商类型错误：{type(provider)}")
+        return provider
+
+    async def _translate_prompt_to_english(self, prompt: str) -> str:
+        provider = self._prompt_translation_provider()
+        template = (
+            self._str_cfg("prompt", "translation_template", "")
+            or DEFAULT_PROMPT_TRANSLATION_TEMPLATE
+        )
+        translation_prompt = template.replace("{prompt}", prompt or "").strip()
+        if "{prompt}" not in template:
+            translation_prompt = f"{translation_prompt}\n\nFinal image prompt:\n{prompt or ''}".strip()
+
+        timeout = max(5, self._int_cfg("prompt", "translation_timeout_seconds", 45))
+        logger.info(
+            "GPT Image prompt English translation start provider=%s prompt_len=%d timeout=%s",
+            self._provider_label(provider),
+            len(prompt or ""),
+            timeout,
+        )
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=translation_prompt,
+                session_id=f"gpt-image-prompt-english-{uuid.uuid4().hex}",
+                persist=False,
+            ),
+            timeout=timeout,
+        )
+        translated = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
+        if not translated:
+            raise RuntimeError("提示词英文化模型没有返回有效内容")
+        max_chars = max(200, self._int_cfg("prompt", "translation_max_output_chars", 4000))
+        translated = translated[:max_chars].rstrip()
+        logger.info(
+            "GPT Image prompt English translation done provider=%s output_len=%d",
+            self._provider_label(provider),
+            len(translated),
+        )
+        return translated
 
     def _render_prompt_enhance_template(self, template: str, **values: str) -> str:
         rendered = template
@@ -1689,6 +2209,9 @@ class GPTImage2Plugin(Star):
             return False
 
         prompt_only_patterns = [
+            r"(翻译|译成|翻成|翻译成|translate|translation).*(中文|英文|日文|日语|韩文|韩语|法文|德文|俄文|to|into)",
+            r"(这段话|这段|这句话|这句|这段文字|这段英文|这段日文|这段prompt|thistext|thissentence).*(翻译|译成|翻成|translate)",
+            r"^(翻译|译成|翻成|translate).+",
             r"(提示词|prompt).*(写|改|优化|润色|翻译|扩写|整理)",
             r"(生成|写|改|优化|润色|翻译|扩写|整理).*(提示词|prompt)",
             r"(怎么|如何|为什么|什么|啥|能不能|可以吗|参数|设置|教程|建议|方案|分析|评价).*(画|生成|生图|出图|改图|图片|图像)",
@@ -1723,6 +2246,8 @@ class GPTImage2Plugin(Star):
             r"(改图|修图|p图|重绘|重画|重新画|扩图|扩展|延展|外扩|补图|补全|补完|补齐|抠图)",
             r"(\u91cd\u753b|\u91cd\u7ed8|\u91cd\u65b0\u753b|\u6539\u753b|\u8f6c\u7ed8|\u6539\u6210|\u6539\u4e3a|\u53d8\u6210|\u53d8\u4e3a|\u8f6c\u6210|\u8f6c\u4e3a|\u505a\u6210).*(\u98ce\u683c|\u753b\u98ce|\u6750\u8d28|\u8d28\u611f|\u6548\u679c|\u6837\u5b50|\u624b\u529e|\u52a8\u6f2b|\u5199\u5b9e|3d|\u50cf\u7d20|\u6c34\u5f69|\u6cb9\u753b|\u4ea7\u54c1\u6e32\u67d3)",
             r"(改|修|换|替换|去掉|删除|加上|添加|合成|参考|照着|补全|补完|补齐|扩展|延展|外扩).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照)",
+            r"(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
+            r"(给|帮|帮我|请).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
             r"(把|将).*(图|图片|照片|背景|主体|人物|文字).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|变成|变为|转成|做成)",
             r"(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|cutout).*(this|the)?(image|picture|photo|background|subject|person|text)",
             r"(this|the)?(image|picture|photo|background|subject|person|text).*(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|cutout)",
@@ -1836,7 +2361,12 @@ class GPTImage2Plugin(Star):
                     return text[len(prefix) :].lstrip()
         return text
 
-    async def _collect_reference_image_paths(self, event: AstrMessageEvent) -> list[str]:
+    async def _collect_reference_image_paths(
+        self,
+        event: AstrMessageEvent,
+        *,
+        include_recent: bool = True,
+    ) -> list[str]:
         max_images = self._max_reference_images()
         paths: list[str] = []
         seen: set[str] = set()
@@ -1891,7 +2421,64 @@ class GPTImage2Plugin(Star):
         await walk(message_chain)
         if len(paths) < max_images:
             await self._add_quoted_reference_image_paths(event, paths, seen, max_images)
+        if not paths and include_recent:
+            paths.extend(self._recent_reference_image_paths(event, max_images=max_images))
         return paths
+
+    def _recent_reference_ttl_seconds(self) -> int:
+        return max(0, self._int_cfg("runtime", "recent_reference_ttl_seconds", 180))
+
+    def _remember_recent_reference_images(self, event: AstrMessageEvent, paths: list[str]) -> None:
+        ttl = self._recent_reference_ttl_seconds()
+        if ttl <= 0:
+            return
+        valid_paths = [os.path.abspath(path) for path in paths if path and os.path.exists(path)]
+        if not valid_paths:
+            return
+        scope = self._event_scope_key(event)
+        self._recent_reference_images[scope] = (time.time(), valid_paths[: self._max_reference_images()])
+        self._cleanup_recent_reference_images()
+        logger.info(
+            "GPT Image cached recent reference images scope=%s count=%d ttl=%ds",
+            scope,
+            len(valid_paths),
+            ttl,
+        )
+
+    def _recent_reference_image_paths(self, event: AstrMessageEvent, *, max_images: int) -> list[str]:
+        ttl = self._recent_reference_ttl_seconds()
+        if ttl <= 0:
+            return []
+        scope = self._event_scope_key(event)
+        cached = self._recent_reference_images.get(scope)
+        if not cached:
+            return []
+        created_at, paths = cached
+        age = time.time() - created_at
+        if age > ttl:
+            self._recent_reference_images.pop(scope, None)
+            return []
+        valid_paths = [os.path.abspath(path) for path in paths if path and os.path.exists(path)]
+        if not valid_paths:
+            self._recent_reference_images.pop(scope, None)
+            return []
+        logger.info(
+            "GPT Image using recent reference images scope=%s count=%d age=%.1fs",
+            scope,
+            len(valid_paths[:max_images]),
+            age,
+        )
+        return valid_paths[:max_images]
+
+    def _cleanup_recent_reference_images(self) -> None:
+        ttl = self._recent_reference_ttl_seconds()
+        if ttl <= 0:
+            self._recent_reference_images.clear()
+            return
+        now = time.time()
+        for scope, (created_at, paths) in list(self._recent_reference_images.items()):
+            if now - created_at > ttl or not any(os.path.exists(path) for path in paths):
+                self._recent_reference_images.pop(scope, None)
 
     async def _add_quoted_reference_image_paths(
         self,

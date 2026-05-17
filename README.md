@@ -12,6 +12,10 @@
 - 支持 OpenAI 官方 Images API、标准 OpenAI-compatible 接口，以及部分网页逆向/2api/ToAPIs 类渠道。
 - 支持 `size`、`resolution`、`aspect_ratio` 的自动归一化。
 - 支持提示词增强模型读取参考图并生成最终图像 prompt。
+- 支持“自拍/人设生图”：用户让 bot 画“你、你的、自己、自拍、本体、形象”等内容时，可用插件内配置的人设改写最终 prompt。
+- 支持引用图片或引用文字中的描述来生成新图，并可在同一会话内短时间沿用最近参考图。
+- 支持在提交图片接口前把最终 prompt 交给文本模型英文化。
+- 增加翻译类、提示词类请求的误触发拦截，减少把普通对话误判成图片任务。
 - 群聊中必须明确 @bot 才允许触发生图/改图，避免误触发和误扣额度。
 - 群聊中 @bot 且文本明确是纯文字生图请求时，会直接进入图片生成流程，不再依赖对话模型自行决定是否调用工具。
 
@@ -47,7 +51,29 @@
 
 因此日常维护时，主要修改 WebUI 里的“完整提示词增强模板”。
 
-### 4. 用户提交提示语
+### 4. 自拍/人设生图
+
+当用户的纯文字生图请求包含“你、你的、自己、自拍、全身照、本体、形象”等指代时，插件会先把插件内配置的人设和用户请求交给文本模型改写成最终图像 prompt，再提交图片接口。
+
+相关配置在 WebUI 的“自拍/人设生图”分组里：
+
+- `self_persona.enable`：启用或关闭插件内生图人设。
+- `self_persona.provider_id`：用于改写人设 prompt 的模型供应商。
+- `self_persona.persona_name`：生图人设名称。
+- `self_persona.persona_prompt`：固定视觉设定。
+- `self_persona.fallback_to_astrbot_persona`：插件内人设为空时是否回退 AstrBot 当前人设。
+
+### 5. 引用描述生图和最近参考图
+
+用户引用一段文字、引用一张带有描述的图片，或先发图再短时间内发“按这个描述生成一张图”时，插件会调用提示词增强模型整理出最终生图 prompt。这个流程是纯文生图，不会强行保留参考图的构图和人物，除非描述本身提出这种要求。
+
+`runtime.recent_reference_ttl_seconds` 控制最近参考图缓存时间，设为 `0` 可关闭。
+
+### 6. 提示词英文化
+
+`prompt.translate_to_english` 开启后，插件会在真正请求图片接口前，把已经整理好的最终 prompt 交给文本模型翻译/改写成英文。翻译模型、模板、超时和失败回退行为都在 `prompt` 分组中配置。
+
+### 7. 用户提交提示语
 
 图片任务被接受后，插件固定回复：
 
@@ -69,6 +95,9 @@
 - `prompt_enhance.enable`：是否启用提示词增强。
 - `prompt_enhance.provider_id`：提示词增强模型供应商 ID。
 - `prompt_enhance.prompt_template`：完整提示词增强模板。
+- `prompt.translate_to_english`：是否在上传图片接口前英文化 prompt。
+- `self_persona.enable`：是否启用自拍/人设生图。
+- `runtime.recent_reference_ttl_seconds`：最近参考图有效时间。
 
 配置文件位于 AstrBot 数据目录，不应进入本仓库。
 
