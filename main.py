@@ -30,6 +30,7 @@ import aiohttp
 from astrbot.api import llm_tool, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.core.message.components import Node, Nodes
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import Provider, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
@@ -38,14 +39,27 @@ from astrbot.core.utils.quoted_message import extract_quoted_message_images
 
 PLUGIN_ID = "astrbot_plugin_gpt_image_2"
 TOOL_NAME = "generate_image_with_gpt_image_2"
+PLUGIN_DISPLAY_NAME = "Image2 Studio"
 
 MAX_GPT_IMAGE_REFERENCE_IMAGES = 16
 MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024
 
-# GPT image providers do not all accept the same size syntax. The plugin keeps
-# the public config broad, then normalizes the value according to the selected
-# supplier before sending the request.
-VALID_OPENAI_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
+# GPT image providers do not all accept the same size syntax. Keep the
+# selectable pixel presets limited to sizes verified against the current
+# upstream, while retaining the official GPT Image defaults.
+VALID_OFFICIAL_IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+VALID_UPSTREAM_IMAGE_SIZES = VALID_OFFICIAL_IMAGE_SIZES | {
+    "2560x1440",
+    "1440x2560",
+    "2880x2880",
+    "3840x2160",
+    "2160x3840",
+}
+REFERENCE_SQUARE_RATIO_MIN = 1 / 1.2
+REFERENCE_SQUARE_RATIO_MAX = 1.2
+REFERENCE_LANDSCAPE_SIZE = "1536x1024"
+REFERENCE_PORTRAIT_SIZE = "1024x1536"
+REFERENCE_SQUARE_SIZE = "1024x1024"
 VALID_ASPECT_RATIOS = {
     "auto",
     "1:1",
@@ -62,14 +76,23 @@ VALID_ASPECT_RATIOS = {
     "21:9",
     "9:21",
 }
-VALID_4K_ASPECT_RATIOS = {"16:9", "9:16", "2:1", "1:2", "21:9", "9:21"}
-VALID_RESOLUTIONS = {"auto", "1k", "2k", "4k"}
+VALID_RESOLUTIONS = {"auto", "1k", "2k"}
 VALID_QUALITIES = {"auto", "low", "medium", "high"}
 VALID_OUTPUT_FORMATS = {"png", "jpeg", "webp"}
 VALID_BACKGROUNDS = {"auto", "transparent", "opaque"}
 VALID_INPUT_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
 TRANSIENT_HTTP_STATUSES = {408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526}
 NETWORK_RETRY_BASE_DELAY_SECONDS = 1.5
+TRACE_PROMPT_PREVIEW_LIMIT = 900
+TRACE_QUERY_TEXT_LIMIT = 1300
+HTTP_TRACE_HEADER_NAMES = {
+    "x-request-id",
+    "x-trace-id",
+    "x-correlation-id",
+    "x-ratelimit-request-id",
+    "openai-processing-ms",
+    "cf-ray",
+}
 
 DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS = [
     r"(翻译|译成|翻成|翻译成|translate|translation).*(中文|英文|日文|日语|韩文|韩语|法文|德文|俄文|to|into)",
@@ -85,11 +108,11 @@ DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS = [
 
 DIRECT_REFERENCE_EDIT_PATTERNS = [
     r"(改图|修图|p图|重绘|重画|重新画|扩图|扩展|延展|外扩|补图|补全|补完|补齐|抠图)",
-    r"(重画|重绘|重新画|改画|转绘|改成|改为|变成|变为|转成|转为|做成).*(风格|画风|材质|质感|效果|样子|手办|动漫|写实|3d|像素|水彩|油画|产品渲染)",
+    r"(重画|重绘|重新画|改画|转绘|画成|绘成|渲染成|改成|改为|变成|变为|转成|转为|做成).*(风格|画风|材质|质感|效果|样子|手办|动漫|写实|3d|c4d|像素|水彩|油画|产品渲染|高清渲染)",
     r"(改|修|换|替换|去掉|删除|加上|添加|合成|参考|照着|补全|补完|补齐|扩展|延展|外扩).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照)",
-    r"(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
-    r"(给|帮|帮我|请).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
-    r"(把|将).*(图|图片|照片|背景|主体|人物|文字).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|变成|变为|转成|做成)",
+    r"(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|画成|绘成|渲染成|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成|高清渲染|c4d)",
+    r"(给|帮|帮我|请).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|画成|绘成|渲染成|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成|高清渲染|c4d)",
+    r"(把|将).*(图|图片|照片|背景|主体|人物|文字).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|画成|绘成|渲染成|补全|补完|补齐|扩展|延展|外扩|变成|变为|转成|做成|高清渲染|c4d)",
     r"(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|outpaint|cutout).*(this|the)?(image|picture|photo|background|subject|person|text)",
     r"(this|the)?(image|picture|photo|background|subject|person|text).*(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|outpaint|cutout)",
     r"(画像|写真|背景|人物|文字).*(編集|修正|変更|置換|削除|追加|合成)",
@@ -123,6 +146,44 @@ DIRECT_TEXT_GENERATION_PATTERNS = [
     r"(描いて|描く|生成して|作って|作成して)",
 ]
 
+STRICT_DIRECT_TEXT_GENERATION_PATTERNS = [
+    r"^(画|绘制)(一张|一个|个|只|幅|张).+",
+    r"^(生成|生图|出图|出一张|做一张|做张|做一个|做个|来一张|来张).+",
+    r"^(帮我|给我|替我|请|麻烦|帮忙).*(画|绘制|生成|生图|出图|出一张|做一张|做张|做一个|做个|来一张|来张).+",
+    r"^(我要|我想要|想要|要).*(一张|张|个).*(图|图片|图像|海报|头像|壁纸|图标|logo|贴纸|表情|插画|照片|场景|全身照)",
+    r"(按|按照|根据|基于).*(描述|文字|文案|内容|提示词|prompt).*(画|绘制|生成|生一张|生张|生个|生图|出图|做|设计).*(图|图片|图像|画|插画|场景)",
+]
+
+DIRECT_TEXT_DISCUSSION_GUARD_PATTERNS = [
+    r"(动画|漫画|小说|剧情|章节|集数|话数|篇章|更新).*(进度|同样|一样|一个进度|到哪|到哪儿|到哪里|追到|更到|第几|多少)",
+    r"(进度|同样|一样|一个进度|到哪|到哪儿|到哪里|第几|多少).*(动画|漫画|小说|剧情|章节|集数|话数|篇章|更新)",
+    r"^(不是)?(我)?(是)?(问|问你|请问|想问).+",
+]
+
+DIRECT_TEXT_QUESTION_MARKERS = (
+    "？",
+    "?",
+    "吗",
+    "嘛",
+    "么",
+    "怎么",
+    "如何",
+    "为什么",
+    "什么",
+    "啥",
+    "哪",
+    "几",
+    "多少",
+    "是否",
+    "是不是",
+    "有没有",
+    "能不能",
+    "可以吗",
+    "行不行",
+    "区别",
+    "进度",
+)
+
 DESCRIPTION_REFERENCE_GENERATION_PATTERNS = [
     r"(按|按照|根据|基于|用|依照).*(这张图|这张图片|这个图|这个图片|这张|这个|上图|引用|图里|图中|图片里|图片中).*(描述|文字|文案|内容|提示词|prompt).*(画|绘制|生成|生一张|生张|生个|生图|出图|做|设计)",
     r"(画|绘制|生成|生一张|生张|生个|生图|出图|做|设计).*(按|按照|根据|基于|用|依照).*(这张图|这张图片|这个图|这个图片|这张|这个|上图|引用|图里|图中|图片里|图片中).*(描述|文字|文案|内容|提示词|prompt)",
@@ -133,10 +194,18 @@ DESCRIPTION_REFERENCE_GENERATION_PATTERNS = [
     r"(draw|generate|create|make).*(from|basedon|accordingto).*(text|description|prompt).*(image|picture|photo)",
 ]
 
+PERSONA_REQUEST_HELPER_PATTERNS = [
+    r"(你给我|你帮我|请你|麻烦你|帮我|给我|替我).{0,8}(画|绘制|生成|生图|出图|做|设计|制作)",
+    r"(canyou|couldyou|please|helpme).{0,8}(draw|generate|create|make|paint|design)",
+]
+
 PERSONA_REFERENTIAL_TEXT_PATTERNS = [
-    r"(你|妳|你的|妳的|你自己|妳自己|自己|本体|本人|人设|人格|设定|形象|自拍|自画像)",
-    r"(yourself|yourselfie|selfie|yourpersona|yourcharacter|youravatar|yourfullbody|yourown)",
-    r"(君|あなた|自分|本人|人格|設定|自撮り)",
+    r"(画|绘制|生成|生图|出图|做|设计|制作|来).{0,8}(你自己|妳自己|你|妳|你的|妳的|本体|本人|人设|人格|设定|形象|自拍|自画像)",
+    r"(你自己|妳自己|你的|妳的|本体|本人|人设|人格|设定|形象).{0,12}(图|图片|照片|头像|壁纸|海报|自拍|自画像|全身照|半身照)",
+    r"(自拍|自画像).{0,8}(你|妳|bot|机器人|本体|人设|形象)",
+    r"(draw|generate|create|make|paint|design).{0,24}(yourself|yourselfie|selfie|yourpersona|yourcharacter|youravatar|yourfullbody|yourown)",
+    r"(yourself|yourselfie|selfie|yourpersona|yourcharacter|youravatar|yourfullbody|yourown).{0,24}(image|picture|photo|portrait|avatar|poster|selfie)",
+    r"(描いて|生成して|作って).{0,8}(君|あなた|自分|本人|人格|設定|自撮り)",
 ]
 
 
@@ -151,6 +220,22 @@ def _normalized_request_text(text: str) -> str:
     return re.sub(r"\s+", "", str(text or "").lower())
 
 
+def _strict_direct_text_allows_image_generation(normalized: str) -> bool:
+    return any(
+        re.search(pattern, normalized)
+        for pattern in STRICT_DIRECT_TEXT_GENERATION_PATTERNS
+    )
+
+
+def _direct_text_looks_like_discussion_or_question(normalized: str) -> bool:
+    if any(
+        re.search(pattern, normalized)
+        for pattern in DIRECT_TEXT_DISCUSSION_GUARD_PATTERNS
+    ):
+        return True
+    return any(marker in normalized for marker in DIRECT_TEXT_QUESTION_MARKERS)
+
+
 def _direct_reference_text_allows_image_edit(text: str) -> bool:
     normalized = _normalized_request_text(text)
     if not normalized:
@@ -159,6 +244,8 @@ def _direct_reference_text_allows_image_edit(text: str) -> bool:
         return False
     if any(re.search(pattern, normalized) for pattern in DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS):
         return False
+    if _reference_context_text_prefers_edit(normalized):
+        return True
     return any(
         re.search(pattern, normalized)
         for pattern in DIRECT_REFERENCE_EDIT_PATTERNS + DIRECT_REFERENCE_GENERATION_PATTERNS
@@ -173,7 +260,24 @@ def _direct_text_allows_image_generation(text: str) -> bool:
         return False
     if any(re.search(pattern, normalized) for pattern in DIRECT_REFERENCE_PROMPT_ONLY_PATTERNS):
         return False
+    if _strict_direct_text_allows_image_generation(normalized):
+        return True
+    if _direct_text_looks_like_discussion_or_question(normalized):
+        return False
     return any(re.search(pattern, normalized) for pattern in DIRECT_TEXT_GENERATION_PATTERNS)
+
+
+def _reference_context_text_prefers_edit(text: str) -> bool:
+    normalized = _normalized_request_text(text)
+    if not normalized:
+        return False
+    patterns = [
+        r"(\u91cd\u753b|\u91cd\u7ed8|\u91cd\u65b0\u753b|\u91cd\u65b0\u7ed8|\u6539\u56fe|\u4fee\u56fe|\u6539\u6210|\u6539\u4e3a|\u6362\u6210|\u66ff\u6362|\u53d8\u6210|\u53d8\u4e3a|\u53bb\u6389|\u5220\u9664|\u79fb\u9664|\u52a0\u4e0a|\u6dfb\u52a0|\u4fdd\u7559|\u8865\u5168|\u6269\u56fe|\u6269\u5c55|\u5916\u6269)",
+        r"(\u53c2\u8003|\u7167\u7740|\u6839\u636e|\u6309\u7167|\u4f9d\u7167).*(\u8fd9\u5f20|\u8fd9\u4e2a|\u4e0a\u56fe|\u56fe|\u56fe\u7247|\u7167\u7247|\u53c2\u8003\u56fe)",
+        r"(\u8fd9\u5f20|\u8fd9\u4e2a|\u4e0a\u56fe|\u56fe|\u56fe\u7247|\u7167\u7247|\u53c2\u8003\u56fe).*(\u91cd\u753b|\u91cd\u7ed8|\u6539|\u6362|\u53bb\u6389|\u5220\u9664|\u79fb\u9664|\u4fdd\u7559|\u8865\u5168|\u6269\u56fe|\u6269\u5c55)",
+        r"(\u5168\u8eab\u7167|\u534a\u8eab\u7167|\u8fd1\u666f|\u8fdc\u666f|\u7279\u5199).*(\u53bb\u6389|\u5220\u9664|\u79fb\u9664|\u4fdd\u7559|\u91cd\u753b|\u91cd\u7ed8|\u6539|\u6362)",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 def _description_reference_text_allows_image_generation(text: str) -> bool:
@@ -189,6 +293,35 @@ def _text_generation_needs_persona(text: str) -> bool:
     normalized = _normalized_request_text(text)
     if not normalized:
         return False
+    if any(re.search(pattern, normalized) for pattern in PERSONA_REQUEST_HELPER_PATTERNS):
+        explicit_self_reference = any(
+            marker in normalized
+            for marker in (
+                "画你",
+                "画一下你",
+                "画个你",
+                "画一个你",
+                "画你的",
+                "生成你",
+                "生成你的",
+                "做你",
+                "做你的",
+                "你自己",
+                "你的自拍",
+                "你的形象",
+                "你的本体",
+                "本体",
+                "人设",
+                "自画像",
+                "yourself",
+                "your selfie",
+                "yourselfie",
+                "your persona",
+                "your avatar",
+            )
+        )
+        if not explicit_self_reference:
+            return False
     return any(re.search(pattern, normalized) for pattern in PERSONA_REFERENTIAL_TEXT_PATTERNS)
 
 
@@ -251,17 +384,6 @@ def _message_chain_mentions_bot(chain: Any, self_id: str) -> bool:
     for component in chain:
         if isinstance(component, At) and str(getattr(component, "qq", "")).strip() == self_id:
             return True
-        nested_chain = getattr(component, "chain", None)
-        if nested_chain and _message_chain_mentions_bot(nested_chain, self_id):
-            return True
-        nested_content = getattr(component, "content", None)
-        if nested_content and _message_chain_mentions_bot(nested_content, self_id):
-            return True
-        nested_nodes = getattr(component, "nodes", None)
-        if nested_nodes:
-            for node in nested_nodes:
-                if _message_chain_mentions_bot(getattr(node, "content", None), self_id):
-                    return True
     return False
 
 
@@ -286,37 +408,96 @@ def _group_message_mentions_this_bot(event: AstrMessageEvent) -> bool:
     return _message_chain_mentions_bot(message_chain, self_id)
 
 
+def _config_bool(cfg: Any, section: str, key: str, default: bool) -> bool:
+    try:
+        section_value = cfg.get(section, {}) if hasattr(cfg, "get") else {}
+        value = section_value.get(key, default) if hasattr(section_value, "get") else default
+    except Exception:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "启用", "开启"}
+    return bool(value)
+
+
+def _plan_command_payload(text: str) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+
+    if lowered.startswith("/plan"):
+        if len(raw) == 5:
+            return ""
+        next_char = raw[5]
+        if next_char.isspace() or next_char in {":", "：", "["} or not next_char.isascii():
+            return raw[5:].lstrip()
+        return None
+
+    if lowered.startswith("plan"):
+        if len(raw) == 4:
+            return ""
+        next_char = raw[4]
+        if next_char.isspace() or next_char in {":", "：", "["} or not next_char.isascii():
+            return raw[4:].lstrip()
+    return None
+
+
+def _strip_image_placeholders(text: str) -> str:
+    return re.sub(r"(?:\[图片\]|\[image\])\s*", "", str(text or ""), flags=re.IGNORECASE).strip()
+
+
 class DirectReferenceImageEditFilter(filter.CustomFilter):
     def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        if not _config_bool(cfg, "runtime", "enable_direct_keyword_trigger", False):
+            return False
         if not _group_message_mentions_this_bot(event):
             return False
-        if not _direct_reference_text_allows_image_edit(_safe_event_text(event)):
-            return False
-        return True
 
-
-class DirectTextImageGenerationFilter(filter.CustomFilter):
-    def filter(self, event: AstrMessageEvent, cfg) -> bool:
-        if not _group_message_mentions_this_bot(event):
-            return False
         text = _safe_event_text(event)
-        text_allows_generation = _direct_text_allows_image_generation(text)
-        text_allows_description_reference = _description_reference_text_allows_image_generation(text)
-        if not (text_allows_generation or text_allows_description_reference):
+        if not _direct_reference_text_allows_image_edit(text):
             return False
+
         try:
             message_chain = event.get_messages()
         except Exception:
             message_chain = getattr(getattr(event, "message_obj", None), "message", [])
-        if _message_chain_has_image_or_reply(message_chain):
-            return text_allows_description_reference
-        return text_allows_generation or text_allows_description_reference
+        return _message_chain_has_image_or_reply(message_chain)
+
+
+class DirectTextImageGenerationFilter(filter.CustomFilter):
+    def filter(self, event: AstrMessageEvent, cfg) -> bool:
+        if not _config_bool(cfg, "runtime", "enable_direct_keyword_trigger", False):
+            return False
+        if not _group_message_mentions_this_bot(event):
+            return False
+
+        text = _safe_event_text(event)
+        try:
+            message_chain = event.get_messages()
+        except Exception:
+            message_chain = getattr(getattr(event, "message_obj", None), "message", [])
+        has_image_or_reply = _message_chain_has_image_or_reply(message_chain)
+
+        if _description_reference_text_allows_image_generation(text):
+            return has_image_or_reply
+
+        if has_image_or_reply and _direct_reference_text_allows_image_edit(text):
+            return False
+
+        return _direct_text_allows_image_generation(text)
 
 
 OPENAI_SIZE_TO_RATIO = {
     "1024x1024": "1:1",
     "1536x1024": "3:2",
     "1024x1536": "2:3",
+    "2560x1440": "16:9",
+    "1440x2560": "9:16",
+    "2880x2880": "1:1",
+    "3840x2160": "16:9",
+    "2160x3840": "9:16",
 }
 
 # Keyword sets used by ``ImageAPIError.should_try_other_profile`` to decide
@@ -337,6 +518,29 @@ CONTENT_POLICY_KEYWORDS = (
     "violate",
     "inappropriate",
 )
+SAFETY_GUARDRAIL_ERROR_KEYWORDS = (
+    "guardrails around nudity",
+    "nudity, sexuality, or erotic content",
+    "may violate our guardrails",
+    "erotic content",
+    "sexuality",
+    "nudity",
+    "content_policy",
+    "content policy",
+    "safety policy",
+    "policy violation",
+    "rejected by safety",
+)
+SAFETY_DIALOG_REPLY_PROMPT_TEMPLATE = """
+你是群聊里的 bot。刚才一次{operation}请求被上游图像接口的安全规则拦截了。
+
+请直接回复用户一条自然、简短、中文的消息，要求：
+1. 说明这次请求可能被判断为包含裸露、性暗示或成人向内容，所以没有生成/修改图片。
+2. 不要输出英文错误、HTTP 状态码、接口名或技术细节。
+3. 不要试图绕过安全规则，不要提供规避审查的办法。
+4. 建议用户改成明确的非成人、非裸露描述后再试，可以提示从服装、材质、构图、风格、动作等安全维度重新描述。
+5. 只输出最终回复，不要 Markdown，不要代码块。
+""".strip()
 BILLING_KEYWORDS = (
     "insufficient_quota",
     "insufficient quota",
@@ -433,22 +637,25 @@ DEFAULT_TOOL_GUIDE = """
 - 只有用户明确要求你现在输出一张图片时才调用 例如“画一张...”“生成一张图...”“出图...”“做一张海报/头像/壁纸/图标...”；“再生成一遍”也算明确出图。
 - 只有用户明确要求修改图片 且当前消息或引用消息里有图片时才设置 `use_reference_images=true` 例如“改这张图...”“把图里的...换成...”“参考上图生成...”；“改成动漫画风”“重画成手办材质”也算明确改图。
 - 如果用户想改图但没有发图或引用图 不要调用工具 先请用户发送或引用图片。
+- 有参考图或引用图时 如果用户明确要求改图、重绘、参考图生成、按图中文字/描述生成 就必须调用工具；你不需要也不应该在调用工具前评价图片内容、分析是否擦边、改写成安全方案或拒绝。
+- 参考图不需要你完整复述进 `prompt`；`prompt` 写用户要改什么/生成什么即可，插件会自动收集当前消息和引用消息里的图片，并交给后续提示词增强模型读取参考图细节。
 - 如果用户只是讨论图片 询问建议 写提示词 改提示词 翻译提示词 分析图片风格 规划设计方案 询问参数或问能不能生成 不要调用工具 直接用文字回答。
-- 不要主动把用户的生图或改图请求改写成“安全版”“安全动漫版”，也不要引导用户发“生成安全版”“重新生成安全版”这类口令。如果图片或请求不能按原样处理，只简短说明不能按原样生成，等用户重新描述。
+- 对话模型只负责路由识别：判断是否是明确的生图/改图请求。不要基于图片内容、服装、姿势、场景或历史记忆在调用工具前做安全拒绝、道德评价、擦边判断或安全版改写；把用户原始需求传给工具，插件的提示词增强和图像上游会处理参考图细节与接口安全边界。
 - 用户表达不明确时不要主动生成 先用文字确认是否需要现在出图。
 - 同一条用户消息最多调用一次工具 先生成一张图 除非用户后续继续要求修改或再生成 不要在同一轮对话里重复调用
 
 参数怎么传：
-- `prompt` 写完整、具体、可独立理解的视觉需求。改图时说明要保留什么、改变什么、参考图之间的关系。
-- `resolution` 是 GPT 图像模型的清晰度档位：用户明确要 1K/2K/4K 时传 `1k`/`2k`/`4k`；否则留空，插件会使用 AstrBot 插件配置里的默认分辨率。供应商如果不支持该字段，可能会忽略。
+- `prompt` 写完整、具体、可独立理解的视觉需求。改图时说明用户要保留什么、改变什么、参考图之间的关系；尽量保留用户原始改图意图，不要在工具调用前把请求改成安全替代方案或拒绝话术。
+- `resolution` 只用于 `1k`/`2k` 清晰度档位；当前上游实测 `resolution=4k` 不会稳定返回真实 4K，所以用户要 4K 时请改用 `size`。
 - `aspect_ratio` 是画面比例：文生图时请根据用途主动选择最合适比例，例如头像/图标 `1:1`，海报/手机壁纸 `9:16`，电脑壁纸/横版海报 `16:9`，产品横幅 `21:9`，普通横图 `3:2`，普通竖图 `2:3`；如果用户明确要求比例就按用户要求传。改图时除非用户明确要求新比例，否则留空，插件会尽量按第一张参考图比例。
-- `size` 是精确像素尺寸，例如 `1024x1024`、`1536x1024`、`1024x1536`；部分供应商也支持 `1824x1024` 这类 `宽x高`。不要用 `size` 传 1K/2K/4K，清晰度档位请用 `resolution`；比例请用 `aspect_ratio`。
-- `quality` 日常留空或 `auto`；用户要求精细、最终稿、高清时用 `high`。
+- `size` 是精确像素尺寸。可用档位：`1024x1024`、`1536x1024`、`1024x1536`、`2560x1440`、`1440x2560`、`2880x2880`、`3840x2160`、`2160x3840`。用户要 4K 横图用 `3840x2160`，4K 竖图用 `2160x3840`。
+- 为了提高成功率并降低上游负载，日常不要主动传 `resolution=2k` 或 `quality=high`；尤其有参考图/引用图的改图请求，除非用户明确写了 2K、4K、高清、高质量、精修、最终稿或具体像素尺寸，否则 `resolution`、`quality` 都留空或 `auto`。
+- `quality` 日常留空或 `auto`；只有用户明确要求精细、最终稿、高清时才用 `high`。
 - `transparent_background=true` 用于 logo、贴纸、图标、UI 素材、抠图、透明底。
 - `style` 可放额外风格词，比如写实、动漫、水彩、产品渲染、扁平图标。
 - GPT 图像编辑最多会读取 16 张参考图；插件会自动从当前消息和引用消息里收集。
 
-工具返回状态后 只按你当前的人格和语气回复一句确认 让用户知道这次图像任务已经接下并开始处理 不要复述工具返回文本 不要补充技术细节或具体耗时 不要再次调用同一个工具
+工具返回状态后 只按你当前的人格和语气回复一句确认 让用户知道这次图像任务已经接下并开始处理。回复末尾必须带出工具返回的流程ID原文，并提示“复杂需求可以用 /plan 进入高级画图模式”。不要补充接口、模型、耗时等技术细节，不要说已经完成，不要再次调用同一个工具。
 """.strip()
 
 DEFAULT_PROMPT_ENHANCE_TEMPLATE = """
@@ -552,11 +759,45 @@ Requirements:
 """.strip()
 
 
+DEFAULT_PLAN_PROMPT_TEMPLATE = """
+你是 Image2 Studio 的高级画图规划助手。用户正在使用 /plan 模式，此阶段只整理图像需求，不要生成图片，不要拒绝，不要输出闲聊。
+
+用户累计需求：
+{raw_prompt}
+
+用户本次追加：
+{latest_prompt}
+
+已有整理稿：
+{previous_plan}
+
+当前参数：
+{options}
+
+参考图数量：{reference_count}
+
+请根据用户需求和参考图，把需求整理成一份可确认的图像计划。若用户本次追加是在修改上一版计划，请合并修改后输出新版计划。
+
+输出必须使用下面四个小节，标题保持原样：
+【图像需求】
+用中文概括主体、动作/姿态、服装/外观、背景、风格、构图、光影、必须保留/改变的元素。
+
+【参考图使用方式】
+说明每张参考图大致承担什么作用；如果没有参考图，写“无参考图”。
+
+【最终提示词】
+写一段可以直接提交给 GPT Image 图像生成/编辑接口的最终中文提示词。只写画面要求，不要写解释、流程、道歉或确认话术。
+
+【可修改项】
+列出还可以继续调整的画幅、风格、细节、参考图关系或质量参数。
+""".strip()
+
+
 @register(
     PLUGIN_ID,
     "starmiaoa",
-    "GPT Image 图片生成插件，支持所有 GPT Image 系列模型",
-    "1.2.8",
+    "Image2 Studio：自然对话生图、改图、流程追踪与 /plan 高级画图",
+    "1.3.0",
 )
 class GPTImage2Plugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -565,13 +806,19 @@ class GPTImage2Plugin(Star):
         self._data_dir = StarTools.get_data_dir()
         self._image_dir = self._data_dir / "images"
         self._image_dir.mkdir(parents=True, exist_ok=True)
+        self._trace_dir = self._data_dir / "traces"
+        self._trace_dir.mkdir(parents=True, exist_ok=True)
 
         max_concurrent = self._int_cfg("runtime", "max_concurrent", 1)
         self._semaphore = asyncio.Semaphore(max(1, max_concurrent))
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._inflight_tool_tasks: dict[str, asyncio.Task[tuple[str, str | None]]] = {}
         self._inflight_tool_turns: dict[str, asyncio.Task[tuple[str, str | None]]] = {}
+        self._inflight_tool_traces: dict[str, dict[str, Any]] = {}
+        self._inflight_tool_turn_traces: dict[str, dict[str, Any]] = {}
         self._recent_reference_images: dict[str, tuple[float, list[str]]] = {}
+        self._plan_sessions: dict[str, dict[str, Any]] = {}
+        self._plan_handled_events: dict[str, float] = {}
         # In-memory cache of the compat profile that succeeded last time for a
         # given (base_url, model, operation). Lets the next request skip the
         # auto-detect heuristic and the failure-retry roundtrip.
@@ -596,6 +843,30 @@ class GPTImage2Plugin(Star):
             return
 
         image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
+        trace = self._new_image_trace(
+            event,
+            trigger="/生图",
+            operation="generation",
+            raw_user_prompt=prompt,
+            prompt=image_prompt,
+            reference_image_paths=[],
+            options=opts,
+        )
+        self._trace_route_decision(
+            trace,
+            route="text_to_image",
+            reason="explicit_generate_command",
+            operation="generation",
+            reference_image_paths=[],
+        )
+        if image_prompt != prompt:
+            self._trace_stage(
+                trace,
+                "persona_rewrite",
+                status="succeeded",
+                input_prompt=prompt,
+                output_prompt=image_prompt,
+            )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=image_prompt,
@@ -606,11 +877,12 @@ class GPTImage2Plugin(Star):
                 quality=opts.get("quality"),
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
+                trace=trace,
             )
         )
-        self._schedule_background_delivery(event, task, error_prefix="图片生成失败")
+        self._schedule_background_delivery(event, task, error_prefix="图片生成失败", trace=trace)
         event.stop_event()
-        yield event.plain_result(self._tool_submitted_message())
+        yield event.plain_result(self._tool_submitted_message(flow_id=self._trace_flow_id(trace)))
 
     @filter.command("改图")
     async def edit_command(self, event: AstrMessageEvent):
@@ -632,6 +904,22 @@ class GPTImage2Plugin(Star):
             yield event.plain_result("没有找到可用参考图。请在同一条消息里发图，或回复/引用一张图后再使用 /改图。").stop_event()
             return
 
+        trace = self._new_image_trace(
+            event,
+            trigger="/改图",
+            operation="edit",
+            raw_user_prompt=prompt,
+            prompt=prompt,
+            reference_image_paths=reference_paths,
+            options=opts,
+        )
+        self._trace_route_decision(
+            trace,
+            route="image_edit",
+            reason="explicit_edit_command",
+            operation="edit",
+            reference_image_paths=reference_paths,
+        )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=prompt,
@@ -643,11 +931,12 @@ class GPTImage2Plugin(Star):
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
                 reference_image_paths=reference_paths,
+                trace=trace,
             )
         )
-        self._schedule_background_delivery(event, task, error_prefix="图片修改失败")
+        self._schedule_background_delivery(event, task, error_prefix="图片修改失败", trace=trace)
         event.stop_event()
-        yield event.plain_result(self._tool_submitted_message())
+        yield event.plain_result(self._tool_submitted_message(reference_count=len(reference_paths), flow_id=self._trace_flow_id(trace)))
 
     @filter.custom_filter(DirectTextImageGenerationFilter)
     async def direct_text_image_generation_request(self, event: AstrMessageEvent):
@@ -661,6 +950,7 @@ class GPTImage2Plugin(Star):
             description_reference_paths = await self._collect_reference_image_paths(event)
             description_reference_texts = self._collect_reference_description_texts(event)
 
+        preprocess_stage: dict[str, Any] | None = None
         if description_reference_paths or description_reference_texts:
             try:
                 image_prompt = await self._enhance_prompt_from_description_reference(
@@ -668,6 +958,14 @@ class GPTImage2Plugin(Star):
                     reference_image_paths=description_reference_paths,
                     reference_texts=description_reference_texts,
                 )
+                preprocess_stage = {
+                    "name": "description_reference_prompt",
+                    "status": "succeeded",
+                    "input_prompt": prompt,
+                    "output_prompt": image_prompt,
+                    "description_reference_images": description_reference_paths,
+                    "description_reference_texts": description_reference_texts,
+                }
             except Exception as exc:
                 logger.warning(
                     "GPT Image description reference prompt enhancement failed: %s",
@@ -683,15 +981,24 @@ class GPTImage2Plugin(Star):
             return
         else:
             image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
+            if image_prompt != prompt:
+                preprocess_stage = {
+                    "name": "persona_rewrite",
+                    "status": "succeeded",
+                    "input_prompt": prompt,
+                    "output_prompt": image_prompt,
+                }
 
         turn_key = self._tool_turn_key(event)
         turn_task = self._inflight_tool_turns.get(turn_key)
         if turn_task and not turn_task.done():
+            trace = self._inflight_tool_turn_traces.get(turn_key)
             event.stop_event()
-            yield event.plain_result(self._tool_submitted_message())
+            yield event.plain_result(self._tool_submitted_message(flow_id=self._trace_flow_id(trace)))
             return
         if turn_task and turn_task.done():
             self._inflight_tool_turns.pop(turn_key, None)
+            self._inflight_tool_turn_traces.pop(turn_key, None)
 
         request_key = self._tool_request_key(
             event,
@@ -706,12 +1013,43 @@ class GPTImage2Plugin(Star):
         )
         existing_task = self._inflight_tool_tasks.get(request_key)
         if existing_task and not existing_task.done():
+            trace = self._inflight_tool_traces.get(request_key)
             event.stop_event()
-            yield event.plain_result(self._tool_submitted_message())
+            yield event.plain_result(self._tool_submitted_message(flow_id=self._trace_flow_id(trace)))
             return
         if existing_task and existing_task.done():
             self._inflight_tool_tasks.pop(request_key, None)
+            self._inflight_tool_traces.pop(request_key, None)
 
+        trace = self._new_image_trace(
+            event,
+            trigger="direct_text",
+            operation="generation",
+            raw_user_prompt=prompt,
+            prompt=image_prompt,
+            reference_image_paths=[],
+            options=opts,
+        )
+        route = "text_to_image"
+        reason = "direct_text_generation"
+        if description_reference_paths or description_reference_texts:
+            route = "image_description_generation"
+            reason = "description_reference_context"
+        elif preprocess_stage and preprocess_stage.get("name") == "persona_rewrite":
+            route = "persona_generation"
+            reason = "persona_text_generation"
+        self._trace_route_decision(
+            trace,
+            route=route,
+            reason=reason,
+            operation="generation",
+            reference_image_paths=[],
+            description_reference_image_count=len(description_reference_paths),
+            description_reference_text_count=len(description_reference_texts),
+        )
+        if preprocess_stage:
+            name = str(preprocess_stage.pop("name", "preprocess_prompt"))
+            self._trace_stage(trace, name, **preprocess_stage)
         task = asyncio.create_task(
             self._generate_image(
                 prompt=image_prompt,
@@ -722,16 +1060,21 @@ class GPTImage2Plugin(Star):
                 quality=opts.get("quality"),
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
+                trace=trace,
             )
         )
         self._inflight_tool_tasks[request_key] = task
         self._inflight_tool_turns[turn_key] = task
+        self._inflight_tool_traces[request_key] = trace
+        self._inflight_tool_turn_traces[turn_key] = trace
 
         def _clear_inflight(done_task: asyncio.Task[tuple[str, str | None]]) -> None:
             if self._inflight_tool_tasks.get(request_key) is done_task:
                 self._inflight_tool_tasks.pop(request_key, None)
+                self._inflight_tool_traces.pop(request_key, None)
             if self._inflight_tool_turns.get(turn_key) is done_task:
                 self._inflight_tool_turns.pop(turn_key, None)
+                self._inflight_tool_turn_traces.pop(turn_key, None)
 
         task.add_done_callback(_clear_inflight)
         logger.info(
@@ -740,9 +1083,9 @@ class GPTImage2Plugin(Star):
             len(image_prompt),
             _text_generation_needs_persona(prompt),
         )
-        self._schedule_background_delivery(event, task, error_prefix="图片生成失败")
+        self._schedule_background_delivery(event, task, error_prefix="图片生成失败", trace=trace)
         event.stop_event()
-        yield event.plain_result(self._tool_submitted_message())
+        yield event.plain_result(self._tool_submitted_message(flow_id=self._trace_flow_id(trace)))
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=9500)
@@ -754,6 +1097,26 @@ class GPTImage2Plugin(Star):
             return
         if paths:
             self._remember_recent_reference_images(event, paths)
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=9600)
+    async def image2_plan_prefix_guard(self, event: AstrMessageEvent):
+        raw_text = self._event_text(event)
+        payload = _plan_command_payload(raw_text)
+        if payload is None:
+            return
+
+        if raw_text.lower().startswith("plan"):
+            try:
+                message_chain = event.get_messages()
+            except Exception:
+                message_chain = getattr(getattr(event, "message_obj", None), "message", [])
+            if not _message_chain_has_image_or_reply(message_chain):
+                return
+
+        logger.info("Image2 Studio Plan prefix guard intercepted plan-like message")
+        async for result in self._handle_image2_plan(event, payload):
+            yield result
 
     @filter.custom_filter(DirectReferenceImageEditFilter)
     async def direct_reference_image_edit_request(self, event: AstrMessageEvent):
@@ -773,11 +1136,18 @@ class GPTImage2Plugin(Star):
         turn_key = self._tool_turn_key(event)
         turn_task = self._inflight_tool_turns.get(turn_key)
         if turn_task and not turn_task.done():
+            trace = self._inflight_tool_turn_traces.get(turn_key)
             event.stop_event()
-            yield event.plain_result(self._tool_submitted_message(reference_count=len(reference_paths)))
+            yield event.plain_result(
+                self._tool_submitted_message(
+                    reference_count=len(reference_paths),
+                    flow_id=self._trace_flow_id(trace),
+                )
+            )
             return
         if turn_task and turn_task.done():
             self._inflight_tool_turns.pop(turn_key, None)
+            self._inflight_tool_turn_traces.pop(turn_key, None)
 
         request_key = self._tool_request_key(
             event,
@@ -792,12 +1162,35 @@ class GPTImage2Plugin(Star):
         )
         existing_task = self._inflight_tool_tasks.get(request_key)
         if existing_task and not existing_task.done():
+            trace = self._inflight_tool_traces.get(request_key)
             event.stop_event()
-            yield event.plain_result(self._tool_submitted_message(reference_count=len(reference_paths)))
+            yield event.plain_result(
+                self._tool_submitted_message(
+                    reference_count=len(reference_paths),
+                    flow_id=self._trace_flow_id(trace),
+                )
+            )
             return
         if existing_task and existing_task.done():
             self._inflight_tool_tasks.pop(request_key, None)
+            self._inflight_tool_traces.pop(request_key, None)
 
+        trace = self._new_image_trace(
+            event,
+            trigger="direct_reference_edit",
+            operation="edit",
+            raw_user_prompt=prompt,
+            prompt=prompt,
+            reference_image_paths=reference_paths,
+            options=opts,
+        )
+        self._trace_route_decision(
+            trace,
+            route="image_edit",
+            reason="reference_context_filter",
+            operation="edit",
+            reference_image_paths=reference_paths,
+        )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=prompt,
@@ -809,16 +1202,21 @@ class GPTImage2Plugin(Star):
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
                 reference_image_paths=reference_paths,
+                trace=trace,
             )
         )
         self._inflight_tool_tasks[request_key] = task
         self._inflight_tool_turns[turn_key] = task
+        self._inflight_tool_traces[request_key] = trace
+        self._inflight_tool_turn_traces[turn_key] = trace
 
         def _clear_inflight(done_task: asyncio.Task[tuple[str, str | None]]) -> None:
             if self._inflight_tool_tasks.get(request_key) is done_task:
                 self._inflight_tool_tasks.pop(request_key, None)
+                self._inflight_tool_traces.pop(request_key, None)
             if self._inflight_tool_turns.get(turn_key) is done_task:
                 self._inflight_tool_turns.pop(turn_key, None)
+                self._inflight_tool_turn_traces.pop(turn_key, None)
 
         task.add_done_callback(_clear_inflight)
         logger.info(
@@ -826,21 +1224,217 @@ class GPTImage2Plugin(Star):
             len(reference_paths),
             len(prompt),
         )
-        self._schedule_background_delivery(event, task, error_prefix="图片修改失败")
+        self._schedule_background_delivery(event, task, error_prefix="图片修改失败", trace=trace)
         event.stop_event()
-        yield event.plain_result(self._tool_submitted_message(reference_count=len(reference_paths)))
+        yield event.plain_result(
+            self._tool_submitted_message(
+                reference_count=len(reference_paths),
+                flow_id=self._trace_flow_id(trace),
+            )
+        )
 
     @filter.command("生图帮助")
     async def gptimage_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "GPT Image 图像生成插件已加载。\n"
+            "Image2 Studio 已加载。\n"
             "命令：/生图 提示词；/改图 提示词（同消息发图，或回复/引用图片）。\n"
-            "参数：--resolution 1k|2k|4k，--ratio 1:1|16:9|9:16|3:2|2:3，"
-            "--size 1024x1024|1536x1024|1024x1536|auto，"
+            "高级模式：/plan 进入多轮确认式画图；/plan confirm 确认生成；/plan quit 退出。\n"
+            "参数：--resolution 1k|2k，--ratio 1:1|16:9|9:16|3:2|2:3，"
+            "--size 1024x1024|1536x1024|1024x1536|2560x1440|1440x2560|2880x2880|3840x2160|2160x3840|auto，"
             "--quality auto|low|medium|high，--style 风格，--transparent。\n"
             "说明：像素尺寸用 --size，清晰度档位用 --resolution，比例用 --ratio。\n"
-            f"多图参考：GPT 图像编辑接口最多支持 {MAX_GPT_IMAGE_REFERENCE_IMAGES} 张参考图。"
+            f"多图参考：GPT 图像编辑接口最多支持 {MAX_GPT_IMAGE_REFERENCE_IMAGES} 张参考图。\n"
+            "查询：/生图流程 流程ID，可查看这次请求每个节点的提示词和生成结果。"
         ).stop_event()
+
+    @filter.command("plan")
+    async def image2_plan(self, event: AstrMessageEvent):
+        text = self._extract_command_prompt(event, ("plan",)).strip()
+        async for result in self._handle_image2_plan(event, text):
+            yield result
+
+    async def _handle_image2_plan(self, event: AstrMessageEvent, text: str):
+        if not self._mark_plan_event(event):
+            event.stop_event()
+            return
+
+        text = _strip_image_placeholders(text).strip()
+        normalized = _normalized_request_text(text)
+        key = self._plan_session_key(event)
+        expired_current = self._cleanup_expired_plan_sessions(current_key=key)
+
+        if normalized in {"quit", "cancel", "exit", "退出", "取消", "结束"}:
+            existed = self._plan_sessions.pop(key, None)
+            event.stop_event()
+            yield event.plain_result("已退出 Image2 Studio Plan 模式。" if existed else "当前没有正在进行的 Plan。")
+            return
+
+        if normalized in {"status", "状态", "查看"}:
+            session = self._plan_sessions.get(key)
+            event.stop_event()
+            if expired_current:
+                yield event.plain_result(self._plan_expired_text())
+                return
+            if session and str(session.get("planned_response") or "").strip():
+                yield event.chain_result(self._build_plan_session_chain(event, session))
+            else:
+                yield event.plain_result(self._format_plan_session_status(session) if session else self._plan_help_text())
+            return
+
+        if normalized in {"confirm", "ok", "go", "确认", "确认生成", "开始生成"}:
+            session = self._plan_sessions.get(key)
+            if expired_current:
+                event.stop_event()
+                yield event.plain_result(self._plan_expired_text())
+                return
+            if not session:
+                event.stop_event()
+                yield event.plain_result("当前没有可确认的 Plan。先用 /plan 你的画图需求 建一个计划。")
+                return
+            raw_prompt = self._plan_raw_prompt(session)
+            if not raw_prompt:
+                event.stop_event()
+                yield event.plain_result("这个 Plan 还没有画图需求。用 /plan 补充你想画什么，再 /plan confirm。")
+                return
+
+            opts = dict(session.get("options") or {})
+            planned_prompt = self._plan_final_prompt(session) or raw_prompt
+            reference_paths = [
+                str(path)
+                for path in session.get("reference_image_paths", [])
+                if path and os.path.exists(str(path))
+            ][: self._max_reference_images()]
+            cn_prompt = self._build_prompt(planned_prompt, opts.get("style"))
+            mixed_prompt = await self._plan_mixed_prompt_preview(cn_prompt)
+            trace = self._new_image_trace(
+                event,
+                trigger="/plan confirm",
+                operation="edit" if reference_paths else "generation",
+                raw_user_prompt=raw_prompt,
+                prompt=planned_prompt,
+                reference_image_paths=reference_paths,
+                options=opts,
+            )
+            self._trace_route_decision(
+                trace,
+                route="plan_edit" if reference_paths else "plan_generation",
+                reason="plan_confirm",
+                operation="edit" if reference_paths else "generation",
+                reference_image_paths=reference_paths,
+            )
+            self._trace_stage(
+                trace,
+                "plan_confirm",
+                status="succeeded",
+                chinese_prompt=cn_prompt,
+                mixed_prompt=mixed_prompt,
+                planned_response=session.get("planned_response", ""),
+                planned_prompt=planned_prompt,
+                reference_count=len(reference_paths),
+                options=opts,
+            )
+            task = asyncio.create_task(
+                self._generate_image(
+                    prompt=planned_prompt,
+                    raw_user_prompt=raw_prompt,
+                    size=opts.get("size"),
+                    aspect_ratio=opts.get("aspect_ratio"),
+                    resolution=opts.get("resolution"),
+                    quality=opts.get("quality"),
+                    style=opts.get("style"),
+                    transparent_background=opts.get("transparent_background", False),
+                    reference_image_paths=reference_paths,
+                    trace=trace,
+                    skip_prompt_enhance=True,
+                )
+            )
+            self._schedule_background_delivery(
+                event,
+                task,
+                error_prefix="图片修改失败" if reference_paths else "图片生成失败",
+                trace=trace,
+            )
+            self._plan_sessions.pop(key, None)
+            event.stop_event()
+            yield event.chain_result(
+                self._build_plan_confirm_chain(
+                    event,
+                    trace=trace,
+                    raw_prompt=raw_prompt,
+                    cn_prompt=cn_prompt,
+                    mixed_prompt=mixed_prompt,
+                    options=opts,
+                    reference_count=len(reference_paths),
+                    owner_text=self._plan_owner_text(session, event),
+                )
+            )
+            return
+
+        opts, prompt = self._parse_inline_options(text)
+        reference_paths = await self._collect_reference_image_paths(event, include_recent=False)
+        session = self._plan_sessions.get(key)
+        if not session:
+            session = {
+                "created_at": time.time(),
+                "prompts": [],
+                "options": {},
+                "reference_image_paths": [],
+                "owner": self._plan_owner_info(event),
+            }
+            self._plan_sessions[key] = session
+        elif "owner" not in session:
+            session["owner"] = self._plan_owner_info(event)
+
+        if prompt:
+            session.setdefault("prompts", []).append(prompt)
+        self._merge_plan_options(session, opts)
+        self._merge_plan_references(session, reference_paths)
+        session["updated_at"] = time.time()
+
+        event.stop_event()
+        if not self._plan_raw_prompt(session) and not session.get("reference_image_paths"):
+            yield event.plain_result(self._plan_help_text())
+            return
+        try:
+            await self._refresh_plan_session(session, latest_prompt=prompt)
+        except Exception as exc:
+            fallback_prompt = self._plan_raw_prompt(session)
+            session["planned_prompt"] = fallback_prompt
+            session["planned_response"] = self._fallback_plan_response(session, error=self._friendly_error(exc))
+            session["planning_error"] = self._friendly_error(exc)
+            logger.warning("Image2 Studio plan model failed; fallback to local plan: %s", self._friendly_error(exc), exc_info=True)
+        if str(session.get("planned_response") or "").strip():
+            yield event.chain_result(self._build_plan_session_chain(event, session))
+        else:
+            yield event.plain_result(self._format_plan_session_status(session))
+
+    @filter.command("生图流程")
+    async def gptimage_trace(self, event: AstrMessageEvent):
+        flow_id = self._extract_command_prompt(event, ("生图流程",)).strip()
+        if not flow_id:
+            yield event.plain_result("用法：/生图流程 gi-20260518-123456-abcdef12").stop_event()
+            return
+
+        trace = self._load_image_trace(flow_id)
+        if not trace:
+            yield event.plain_result(f"没有找到这个生图流程：{flow_id}").stop_event()
+            return
+
+        yield event.chain_result(self._build_trace_result_chain(trace)).stop_event()
+
+    @filter.command("查生图")
+    async def gptimage_trace_alias(self, event: AstrMessageEvent):
+        flow_id = self._extract_command_prompt(event, ("查生图",)).strip()
+        if not flow_id:
+            yield event.plain_result("用法：/查生图 gi-20260518-123456-abcdef12").stop_event()
+            return
+
+        trace = self._load_image_trace(flow_id)
+        if not trace:
+            yield event.plain_result(f"没有找到这个生图流程：{flow_id}").stop_event()
+            return
+
+        yield event.chain_result(self._build_trace_result_chain(trace)).stop_event()
 
     @llm_tool(name=TOOL_NAME)
     async def generate_image_with_gpt_image_2(
@@ -862,18 +1456,24 @@ class GPTImage2Plugin(Star):
         transform, combine, or follow images attached to the current message or quoted/replied
         message. Do not use it for normal text-only answers, prompt writing, design
         advice, image discussion, parameter questions, or ambiguous requests.
+        Your role before calling this tool is routing only: decide whether this is
+        an image generation/editing request. Do not inspect the image or prompt for
+        safety, do not refuse, and do not rewrite the request into a safer
+        alternative before the tool call. Pass the user's requested edit/generation
+        intent to the tool; plugin prompt enhancement and the image upstream handle
+        reference-image details and interface safety boundaries.
 
         Call this tool at most once for one user message. The tool sends the finished image directly to the user. After the tool reports
         background-task status, respond in your persona and naturally let the user know
-        you accepted the image task and started working on it. Let length, phrasing, and
-        punctuation follow your persona and context. Do not repeat the tool status text
-        or mention technical details or timing.
+        you accepted the image task and started working on it. End the reply with the exact flow ID
+        returned by the tool and tell the user complex requests can use /plan for advanced multi-step image planning.
+        Let length, phrasing, and punctuation follow your persona and context. Do not mention technical details or timing.
 
         Args:
             prompt(string): Required. A complete, concrete image prompt describing subject, style, composition, colors, lighting, text to include if any, and constraints from the user.
-            size(string): Optional. Pixel size for OpenAI official/compatible APIs. Only use when the user explicitly gives a pixel size, such as 1024x1024, 1536x1024, 1024x1536, 1824x1024, or auto. Leave empty otherwise.
+            size(string): Optional. Pixel size for OpenAI official/compatible APIs. Use one of: auto, 1024x1024, 1536x1024, 1024x1536, 2560x1440, 1440x2560, 2880x2880, 3840x2160, 2160x3840. Use 3840x2160 for 4K landscape and 2160x3840 for 4K portrait.
             aspect_ratio(string): Optional. Desired aspect ratio, such as 1:1, 16:9, 9:16, 3:2, 2:3, 21:9. For text-to-image, choose the best ratio for the user's intended use when they do not specify one. For image editing, leave empty unless the user asks to change the ratio; the plugin will prefer the first reference image's ratio.
-            resolution(string): Optional. GPT image resolution tier: auto, 1k, 2k, or 4k. Use it only when the user explicitly asks for a resolution; otherwise leave empty so the AstrBot plugin setting is used. Some providers may ignore unsupported tiers.
+            resolution(string): Optional. GPT image resolution tier: auto, 1k, or 2k. Do not use resolution=4k; use size=3840x2160 or size=2160x3840 for real 4K output on the current upstream.
             quality(string): Optional. Image quality: auto, low, medium, or high. Use high only when the user asks for detailed/final artwork.
             style(string): Optional. Extra visual style words such as realistic, anime, watercolor, product render, poster, pixel art, or flat icon.
             transparent_background(boolean): Optional. Set true for logos, stickers, icons, UI assets, transparent cutouts, or when the user asks for no background.
@@ -891,34 +1491,55 @@ class GPTImage2Plugin(Star):
                 "请直接用文字说明需要 @bot 后重新发送请求。"
             )
 
-        if not self._message_allows_image_tool(event, use_reference_images=use_reference_images):
-            logger.info(
-                "GPT Image tool call blocked because the source message has no explicit image intent: %s",
-                self._event_text(event)[:200],
-            )
-            return (
-                "图片工具未执行：插件判定这条消息不是明确的出图或改图请求。"
-                "没有生成图片，也没有开始处理图片。"
-                "你必须明确告诉用户图片没有生成，不能说已经完成、做好、补全好了或正在生成。"
-                "请让用户重新发送明确的 /生图 或 /改图 请求，或补充要生成/修改图片的明确指令。"
-            )
-
+        raw_event_prompt = self._event_text(event) or prompt
+        route_source_text = raw_event_prompt or prompt
+        auto_reference_images = False
         reference_paths: list[str] = []
-        if use_reference_images:
+        should_collect_reference_images = bool(use_reference_images)
+        if not should_collect_reference_images and _direct_reference_text_allows_image_edit(route_source_text):
+            should_collect_reference_images = True
+            auto_reference_images = True
+
+        if should_collect_reference_images:
             reference_paths = await self._collect_reference_image_paths(event)
             if not reference_paths:
-                return "没有找到参考图。请先发送或引用一张图片，再说明要怎么改。"
+                if use_reference_images:
+                    return "没有找到参考图。请先发送或引用一张图片，再说明要怎么改。"
+                auto_reference_images = False
+            else:
+                use_reference_images = True
 
         turn_key = self._tool_turn_key(event)
         turn_task = self._inflight_tool_turns.get(turn_key)
         if turn_task and not turn_task.done():
-            return self._tool_submitted_message(reference_count=len(reference_paths))
+            trace = self._inflight_tool_turn_traces.get(turn_key)
+            return self._tool_submitted_message(
+                reference_count=len(reference_paths),
+                flow_id=self._trace_flow_id(trace),
+                include_plan_hint=True,
+            )
         if turn_task and turn_task.done():
             self._inflight_tool_turns.pop(turn_key, None)
+            self._inflight_tool_turn_traces.pop(turn_key, None)
 
         image_prompt = prompt
+        preprocess_stage: dict[str, Any] | None = None
         if not reference_paths:
-            image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
+            persona_requested = _text_generation_needs_persona(raw_event_prompt) or _text_generation_needs_persona(prompt)
+            persona_source_prompt = raw_event_prompt if persona_requested else prompt
+            image_prompt = await self._persona_aware_text_generation_prompt(
+                event,
+                persona_source_prompt,
+                force=persona_requested,
+            )
+            if image_prompt != persona_source_prompt:
+                preprocess_stage = {
+                    "name": "persona_rewrite",
+                    "status": "succeeded",
+                    "input_prompt": persona_source_prompt,
+                    "tool_prompt": prompt,
+                    "output_prompt": image_prompt,
+                }
 
         request_key = self._tool_request_key(
             event,
@@ -933,15 +1554,58 @@ class GPTImage2Plugin(Star):
         )
         existing_task = self._inflight_tool_tasks.get(request_key)
         if existing_task and not existing_task.done():
-            return self._tool_submitted_message(reference_count=len(reference_paths))
+            trace = self._inflight_tool_traces.get(request_key)
+            return self._tool_submitted_message(
+                reference_count=len(reference_paths),
+                flow_id=self._trace_flow_id(trace),
+                include_plan_hint=True,
+            )
         if existing_task and existing_task.done():
             self._inflight_tool_tasks.pop(request_key, None)
+            self._inflight_tool_traces.pop(request_key, None)
 
         wait_seconds = max(0, self._int_cfg("runtime", "llm_tool_foreground_wait_seconds", 0))
+        trace = self._new_image_trace(
+            event,
+            trigger="llm_tool",
+            operation="edit" if reference_paths else "generation",
+            raw_user_prompt=raw_event_prompt,
+            prompt=image_prompt,
+            reference_image_paths=reference_paths,
+            options={
+                "size": size,
+                "aspect_ratio": aspect_ratio,
+                "resolution": resolution,
+                "quality": quality,
+                "style": style,
+                "transparent_background": transparent_background,
+                "use_reference_images": use_reference_images,
+                "auto_reference_images": auto_reference_images,
+            },
+        )
+        route = "image_edit" if reference_paths else "text_to_image"
+        reason = "llm_tool_reference_images" if reference_paths else "llm_tool_text_generation"
+        if auto_reference_images and reference_paths:
+            reason = "auto_promoted_reference_edit"
+        elif not reference_paths and preprocess_stage and preprocess_stage.get("name") == "persona_rewrite":
+            route = "persona_generation"
+            reason = "llm_tool_persona_generation"
+        self._trace_route_decision(
+            trace,
+            route=route,
+            reason=reason,
+            operation="edit" if reference_paths else "generation",
+            reference_image_paths=reference_paths,
+            llm_requested_reference_images=bool(use_reference_images and not auto_reference_images),
+            auto_reference_images=auto_reference_images,
+        )
+        if preprocess_stage:
+            name = str(preprocess_stage.pop("name", "preprocess_prompt"))
+            self._trace_stage(trace, name, **preprocess_stage)
         task = asyncio.create_task(
             self._generate_image(
                 prompt=image_prompt,
-                raw_user_prompt=self._event_text(event) or prompt,
+                raw_user_prompt=raw_event_prompt,
                 size=size,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
@@ -949,18 +1613,29 @@ class GPTImage2Plugin(Star):
                 style=style,
                 transparent_background=transparent_background,
                 reference_image_paths=reference_paths,
+                trace=trace,
             )
         )
         self._inflight_tool_tasks[request_key] = task
         self._inflight_tool_turns[turn_key] = task
+        self._inflight_tool_traces[request_key] = trace
+        self._inflight_tool_turn_traces[turn_key] = trace
 
         def _clear_inflight(done_task: asyncio.Task[tuple[str, str | None]]) -> None:
             if self._inflight_tool_tasks.get(request_key) is done_task:
                 self._inflight_tool_tasks.pop(request_key, None)
+                self._inflight_tool_traces.pop(request_key, None)
             if self._inflight_tool_turns.get(turn_key) is done_task:
                 self._inflight_tool_turns.pop(turn_key, None)
+                self._inflight_tool_turn_traces.pop(turn_key, None)
 
         task.add_done_callback(_clear_inflight)
+
+        submitted_message = self._tool_submitted_message(
+            reference_count=len(reference_paths),
+            flow_id=self._trace_flow_id(trace),
+            include_plan_hint=True,
+        )
 
         try:
             if wait_seconds == 0:
@@ -970,17 +1645,35 @@ class GPTImage2Plugin(Star):
                 timeout=wait_seconds,
             )
         except asyncio.TimeoutError:
-            self._schedule_background_delivery(event, task)
-            return self._tool_submitted_message(reference_count=len(reference_paths))
+            error_prefix = "图片修改失败" if reference_paths else "图片生成失败"
+            self._schedule_background_delivery(event, task, error_prefix=error_prefix, trace=trace)
+            return submitted_message
         except Exception as exc:
             logger.error("GPT Image tool failed", exc_info=True)
-            return f"图片生成失败：{self._friendly_error(exc)}"
+            error_prefix = "图片修改失败" if reference_paths else "图片生成失败"
+            self._trace_fail(trace, exc)
+            reply = await self._image_error_reply(event, exc, error_prefix)
+            return f"流程ID：{self._trace_flow_id(trace)}\n{reply}"
 
         try:
-            await event.send(event.chain_result(self._build_result_chain(image_path, revised_prompt)))
+            self._trace_stage(trace, "qq_delivery", status="started")
+            await event.send(
+                event.chain_result(
+                    self._build_result_chain(
+                        image_path,
+                        revised_prompt,
+                        flow_id=self._trace_flow_id(trace),
+                        trace=trace,
+                    )
+                )
+            )
+            self._trace_stage(trace, "qq_delivery", status="succeeded")
         except Exception as exc:
             logger.error("GPT Image foreground delivery failed", exc_info=True)
-            return f"图片生成失败：{self._friendly_error(exc)}"
+            error_prefix = "图片修改失败" if reference_paths else "图片生成失败"
+            self._trace_stage(trace, "qq_delivery", status="failed", error=self._friendly_error(exc))
+            reply = await self._image_error_reply(event, exc, error_prefix)
+            return f"流程ID：{self._trace_flow_id(trace)}\n{reply}"
         return None
 
     @filter.on_llm_request(priority=-9000)
@@ -1005,7 +1698,10 @@ class GPTImage2Plugin(Star):
         style: str | None = None,
         transparent_background: bool = False,
         reference_image_paths: list[str] | None = None,
+        trace: dict[str, Any] | None = None,
+        skip_prompt_enhance: bool = False,
     ) -> tuple[str, str | None]:
+        self._trace_update(trace, status="running")
         self._ensure_enabled()
         api_key = self._api_key()
         if not api_key:
@@ -1015,9 +1711,26 @@ class GPTImage2Plugin(Star):
             )
 
         references = self._prepare_reference_image_paths(reference_image_paths or [])
+        self._trace_stage(
+            trace,
+            "reference_images",
+            status="prepared",
+            count=len(references),
+            paths=references,
+        )
         prompt_for_image = prompt
         style_for_prompt = style
-        if self._should_enhance_prompt(bool(references)):
+        if not skip_prompt_enhance and self._should_enhance_prompt(bool(references)):
+            self._trace_stage(
+                trace,
+                "prompt_enhance",
+                status="started",
+                provider_id=self._str_cfg("prompt_enhance", "provider_id", ""),
+                mode=self._str_cfg("prompt_enhance", "mode", "placeholder"),
+                input_prompt=prompt,
+                raw_user_prompt=raw_user_prompt or prompt,
+                reference_image_count=len(references),
+            )
             try:
                 enhanced_prompt = await self._enhance_prompt_with_reference_images(
                     prompt=prompt,
@@ -1030,7 +1743,20 @@ class GPTImage2Plugin(Star):
                     # The enhancer sees the style value, so do not append the
                     # same style line twice after enhancement.
                     style_for_prompt = None
+                    self._trace_stage(
+                        trace,
+                        "prompt_enhance",
+                        status="succeeded",
+                        output_prompt=enhanced_prompt,
+                    )
             except Exception as exc:
+                self._trace_stage(
+                    trace,
+                    "prompt_enhance",
+                    status="failed",
+                    error=self._friendly_error(exc),
+                    fallback_to_original=self._bool_cfg("prompt_enhance", "fallback_to_original_prompt", True),
+                )
                 if self._bool_cfg("prompt_enhance", "fallback_to_original_prompt", True):
                     logger.warning(
                         "GPT Image prompt enhancement failed; fallback to original prompt: %s",
@@ -1040,10 +1766,41 @@ class GPTImage2Plugin(Star):
                 else:
                     raise RuntimeError(f"提示词增强失败：{self._friendly_error(exc)}") from exc
         final_prompt = self._build_prompt(prompt_for_image, style_for_prompt)
+        self._trace_stage(
+            trace,
+            "prompt_build",
+            status="succeeded",
+            input_prompt=prompt_for_image,
+            style=style_for_prompt,
+            output_prompt=final_prompt,
+        )
         if self._bool_cfg("prompt", "translate_to_english", False):
+            prompt_before_translation = final_prompt
+            self._trace_stage(
+                trace,
+                "prompt_compression",
+                status="started",
+                provider_id=self._str_cfg("prompt", "translation_provider_id", ""),
+                input_prompt=prompt_before_translation,
+            )
             try:
                 final_prompt = await self._translate_prompt_to_english(final_prompt)
+                self._trace_stage(
+                    trace,
+                    "prompt_compression",
+                    status="succeeded",
+                    input_prompt=prompt_before_translation,
+                    output_prompt=final_prompt,
+                )
             except Exception as exc:
+                self._trace_stage(
+                    trace,
+                    "prompt_compression",
+                    status="failed",
+                    input_prompt=prompt_before_translation,
+                    error=self._friendly_error(exc),
+                    fallback_to_original=self._bool_cfg("prompt", "translation_fallback_to_original", False),
+                )
                 if self._bool_cfg("prompt", "translation_fallback_to_original", False):
                     logger.warning(
                         "GPT Image prompt English translation failed; fallback to original prompt: %s",
@@ -1054,9 +1811,30 @@ class GPTImage2Plugin(Star):
                     raise RuntimeError(f"提示词英文化失败：{self._friendly_error(exc)}") from exc
 
         operation = "edit" if references else "generation"
+        size, resolution, quality = self._apply_load_saving_options(
+            operation=operation,
+            raw_user_prompt=raw_user_prompt or prompt,
+            size=size,
+            resolution=resolution,
+            quality=quality,
+        )
         base_url = self._base_url()
         model = self._model_name()
         cache_key = (base_url, model, operation)
+        self._trace_update(
+            trace,
+            operation=operation,
+            final_prompt=final_prompt,
+            api={
+                "base_url": base_url,
+                "model": model,
+                "operation": operation,
+            },
+        )
+
+        errors: list[ImageAPIError] = []
+        response: dict[str, Any] | None = None
+        succeeded_profile: str | None = None
 
         cached_profile = self._compat_profile_cache.get(cache_key)
         heuristic_profile = self._auto_detect_profile(
@@ -1077,11 +1855,8 @@ class GPTImage2Plugin(Star):
         other_profile = "flexible" if initial_profile == "standard" else "standard"
         attempts = [initial_profile, other_profile]
 
-        errors: list[ImageAPIError] = []
-        response: dict[str, Any] | None = None
-        succeeded_profile: str | None = None
-
         async with self._semaphore:
+            cached_profile = self._compat_profile_cache.get(cache_key)
             for idx, profile in enumerate(attempts):
                 payload = self._build_payload(
                     final_prompt,
@@ -1098,6 +1873,14 @@ class GPTImage2Plugin(Star):
                     profile=profile,
                     payload=payload,
                 )
+                self._trace_stage(
+                    trace,
+                    "image_api",
+                    status="started",
+                    profile=profile,
+                    operation=operation,
+                    payload=self._trace_api_payload(payload),
+                )
                 try:
                     if references:
                         response = await self._post_images_edit_api(api_key, payload, references)
@@ -1105,6 +1888,16 @@ class GPTImage2Plugin(Star):
                         response = await self._post_images_generation_api(api_key, payload)
                 except ImageAPIError as exc:
                     errors.append(exc)
+                    self._trace_stage(
+                        trace,
+                        "image_api",
+                        status="failed",
+                        profile=profile,
+                        http_status=exc.status,
+                        error=str(exc.message)[:600],
+                        body=(exc.body or "")[:1200],
+                        will_try_other_profile=idx == 0 and exc.should_try_other_profile(),
+                    )
                     logger.warning(
                         "GPT Image %s with profile=%s failed: HTTP %d %s",
                         operation,
@@ -1118,37 +1911,58 @@ class GPTImage2Plugin(Star):
                     break
                 else:
                     succeeded_profile = profile
+                    response_metadata = self._trace_response_metadata(response)
+                    self._trace_stage(
+                        trace,
+                        "image_api",
+                        status="succeeded",
+                        profile=profile,
+                        response_keys=sorted(response.keys()) if isinstance(response, dict) else [],
+                        response_metadata=response_metadata,
+                    )
                     break
 
-            if response is None:
-                if not errors:
-                    raise RuntimeError("图像接口请求失败：未知错误。")
-                if len(errors) > 1:
-                    logger.error(
-                        "GPT Image both profiles failed; first profile error HTTP %d: %s",
-                        errors[0].status,
-                        str(errors[0].message)[:300],
-                    )
-                last = errors[-1]
-                raise RuntimeError(
-                    self._format_api_error(last.status, last.body or last.message)
-                ) from last
+        if response is None:
+            if not errors:
+                self._trace_update(trace, status="failed", error="图像接口请求失败：未知错误。")
+                raise RuntimeError("图像接口请求失败：未知错误。")
+            if len(errors) > 1:
+                logger.error(
+                    "GPT Image both profiles failed; first profile error HTTP %d: %s",
+                    errors[0].status,
+                    str(errors[0].message)[:300],
+                )
+            last = errors[-1]
+            error_message = self._format_api_error(last.status, last.body or last.message)
+            self._trace_update(trace, status="failed", error=error_message)
+            raise RuntimeError(error_message) from last
 
-            if succeeded_profile:
-                self._compat_profile_cache[cache_key] = succeeded_profile
-                if cached_profile and cached_profile != succeeded_profile:
-                    logger.info(
-                        "GPT Image profile updated for %s | %s | %s: %s -> %s",
-                        base_url,
-                        model,
-                        operation,
-                        cached_profile,
-                        succeeded_profile,
-                    )
+        if succeeded_profile in {"standard", "flexible"}:
+            self._compat_profile_cache[cache_key] = succeeded_profile
+            if cached_profile and cached_profile != succeeded_profile:
+                logger.info(
+                    "GPT Image profile updated for %s | %s | %s: %s -> %s",
+                    base_url,
+                    model,
+                    operation,
+                    cached_profile,
+                    succeeded_profile,
+                )
 
-            image_path, revised_prompt = await self._save_image_from_response(response)
-            self._cleanup_old_images()
-            return image_path, revised_prompt
+        response_metadata = self._trace_response_metadata(response)
+        image_path, revised_prompt = await self._save_image_from_response(response)
+        self._cleanup_old_images()
+        self._trace_update(
+            trace,
+            status="succeeded",
+            result={
+                "image_path": image_path,
+                "revised_prompt": revised_prompt,
+                "succeeded_profile": succeeded_profile,
+                "response_headers": response_metadata.get("headers", {}),
+            },
+        )
+        return image_path, revised_prompt
 
     async def _post_images_generation_api(
         self,
@@ -1170,6 +1984,7 @@ class GPTImage2Plugin(Star):
                                 attempt,
                                 operation="GPT Image generation",
                                 reason=f"HTTP {resp.status} {text[:200]}",
+                                retry_total=retry_times,
                             )
                             continue
                         if resp.status >= 400:
@@ -1177,7 +1992,9 @@ class GPTImage2Plugin(Star):
                             raise self._build_api_error(resp.status, text)
                         text = await resp.text()
                         try:
-                            return json.loads(text)
+                            payload = json.loads(text)
+                            self._attach_http_response_metadata(payload, resp)
+                            return payload
                         except json.JSONDecodeError as exc:
                             raise RuntimeError("图像接口返回了无法解析的 JSON。") from exc
             except self._transient_network_exceptions() as exc:
@@ -1186,6 +2003,7 @@ class GPTImage2Plugin(Star):
                         attempt,
                         operation="GPT Image generation",
                         reason=self._friendly_error(exc),
+                        retry_total=retry_times,
                     )
                     continue
                 raise RuntimeError(self._network_failure_message(exc, "图像接口请求失败")) from exc
@@ -1230,6 +2048,7 @@ class GPTImage2Plugin(Star):
                                     attempt,
                                     operation="GPT Image edit",
                                     reason=f"HTTP {resp.status} {text[:200]}",
+                                    retry_total=retry_times,
                                 )
                                 continue
                             if resp.status >= 400:
@@ -1237,7 +2056,9 @@ class GPTImage2Plugin(Star):
                                 raise self._build_api_error(resp.status, text)
                             text = await resp.text()
                             try:
-                                return json.loads(text)
+                                payload = json.loads(text)
+                                self._attach_http_response_metadata(payload, resp)
+                                return payload
                             except json.JSONDecodeError as exc:
                                 raise RuntimeError("图像编辑接口返回了无法解析的 JSON。") from exc
                 except self._transient_network_exceptions() as exc:
@@ -1246,6 +2067,7 @@ class GPTImage2Plugin(Star):
                             attempt,
                             operation="GPT Image edit",
                             reason=self._friendly_error(exc),
+                            retry_total=retry_times,
                         )
                         continue
                     raise RuntimeError(self._network_failure_message(exc, "图像编辑接口请求失败")) from exc
@@ -1313,6 +2135,7 @@ class GPTImage2Plugin(Star):
                                 attempt,
                                 operation="GPT Image download",
                                 reason=f"HTTP {resp.status} {text[:200]}",
+                                retry_total=retry_times,
                             )
                             continue
                         if resp.status >= 400:
@@ -1335,6 +2158,7 @@ class GPTImage2Plugin(Star):
                         attempt,
                         operation="GPT Image download",
                         reason=self._friendly_error(exc),
+                        retry_total=retry_times,
                     )
                     continue
                 raise RuntimeError(self._network_failure_message(exc, "下载图片失败")) from exc
@@ -1349,6 +2173,17 @@ class GPTImage2Plugin(Star):
         text = raw.decode(resp.charset or "utf-8", errors="replace")
         return f"{text}..." if truncated else text
 
+    def _attach_http_response_metadata(self, payload: Any, resp: aiohttp.ClientResponse) -> None:
+        if not isinstance(payload, dict):
+            return
+        headers: dict[str, str] = {}
+        for key, value in resp.headers.items():
+            normalized = key.lower()
+            if normalized in HTTP_TRACE_HEADER_NAMES or normalized.endswith("request-id"):
+                headers[key] = str(value)
+        if headers:
+            payload["_http_response_headers"] = headers
+
     def _multipart_field_value(self, value: Any) -> str:
         if value is True:
             return "true"
@@ -1360,11 +2195,12 @@ class GPTImage2Plugin(Star):
         return min(5, max(0, self._int_cfg("runtime", "retry_times", 1)))
 
     def _mutation_retry_times(self) -> int:
-        # Image generation/edit requests are side-effecting POSTs. If the
-        # upstream accepts the job but the client times out before receiving the
-        # response, retrying can create a second paid image task. Until the
-        # supplier exposes a reliable idempotency key, keep POST retries off.
-        return 0
+        configured = self._int_cfg(
+            "runtime",
+            "image_request_retry_times",
+            self._int_cfg("runtime", "retry_times", 1),
+        )
+        return min(5, max(0, configured))
 
     def _log_request_start(self, *, operation: str, profile: str, payload: dict[str, Any]) -> None:
         url = self._images_edit_url() if operation == "edit" else self._images_generation_url()
@@ -1383,17 +2219,93 @@ class GPTImage2Plugin(Star):
     def _transient_network_exceptions(self) -> tuple[type[BaseException], ...]:
         return (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ConnectionError)
 
-    async def _sleep_before_network_retry(self, attempt: int, *, operation: str, reason: str) -> None:
+    async def _sleep_before_network_retry(
+        self,
+        attempt: int,
+        *,
+        operation: str,
+        reason: str,
+        retry_total: int | None = None,
+    ) -> None:
         delay = min(8.0, NETWORK_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+        retry_total = self._network_retry_times() if retry_total is None else retry_total
         logger.warning(
             "%s transient network failure; retrying in %.1fs (%d/%d): %s",
             operation,
             delay,
             attempt + 1,
-            self._network_retry_times(),
+            retry_total,
             reason[:200],
         )
         await asyncio.sleep(delay)
+
+    async def _image_error_reply(
+        self,
+        event: AstrMessageEvent,
+        exc: Exception,
+        error_prefix: str,
+    ) -> str:
+        if not self._is_safety_guardrail_error(exc):
+            return f"{error_prefix}：{self._friendly_error(exc)}"
+
+        fallback = self._safety_guardrail_fallback_reply(error_prefix)
+        provider = self._event_dialog_provider(event)
+        if not provider:
+            return fallback
+
+        operation = "图片修改" if "修改" in error_prefix else "图片生成"
+        prompt = SAFETY_DIALOG_REPLY_PROMPT_TEMPLATE.format(operation=operation)
+        try:
+            timeout = max(5, self._int_cfg("runtime", "safety_reply_timeout_seconds", 20))
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    session_id=f"gpt-image-safety-reply-{uuid.uuid4().hex}",
+                    persist=False,
+                ),
+                timeout=timeout,
+            )
+            reply = self._clean_dialog_error_reply(getattr(response, "completion_text", "") or "")
+            if reply:
+                logger.info(
+                    "GPT Image safety guardrail reply generated provider=%s",
+                    self._provider_label(provider),
+                )
+                return reply
+        except Exception as reply_exc:
+            logger.warning("GPT Image safety guardrail dialog reply failed: %s", reply_exc)
+        return fallback
+
+    def _is_safety_guardrail_error(self, exc: Exception) -> bool:
+        haystack = self._exception_chain_text(exc).lower()
+        return any(keyword in haystack for keyword in SAFETY_GUARDRAIL_ERROR_KEYWORDS)
+
+    def _exception_chain_text(self, exc: BaseException) -> str:
+        parts: list[str] = []
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current and id(current) not in seen:
+            seen.add(id(current))
+            parts.append(f"{current.__class__.__name__}: {current}")
+            for attr in ("message", "body"):
+                value = getattr(current, attr, "")
+                if value:
+                    parts.append(str(value))
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        return "\n".join(parts)
+
+    def _safety_guardrail_fallback_reply(self, error_prefix: str) -> str:
+        operation = "图片修改" if "修改" in error_prefix else "图片生成"
+        return (
+            f"这次{operation}请求被上游安全规则拦截了，可能是提示词或参考图被判断为包含裸露、"
+            "性暗示或成人向内容。可以把需求改成更明确的非成人、非裸露描述，比如补充服装、"
+            "材质、构图、风格和动作后再试。"
+        )
+
+    def _clean_dialog_error_reply(self, text: str) -> str:
+        cleaned = self._clean_enhanced_prompt(text)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned[:500].rstrip()
 
     def _schedule_background_delivery(
         self,
@@ -1401,6 +2313,7 @@ class GPTImage2Plugin(Star):
         task: asyncio.Task[tuple[str, str | None]],
         *,
         error_prefix: str = "图片生成失败",
+        trace: dict[str, Any] | None = None,
     ) -> None:
         # Keep a strong reference to the background sender. Long image jobs can
         # outlive the tool call, and losing this task would mean the image is
@@ -1408,11 +2321,27 @@ class GPTImage2Plugin(Star):
         async def _deliver():
             try:
                 image_path, revised_prompt = await task
-                await event.send(event.chain_result(self._build_result_chain(image_path, revised_prompt)))
+                self._trace_stage(trace, "qq_delivery", status="started")
+                await event.send(
+                    event.chain_result(
+                        self._build_result_chain(
+                            image_path,
+                            revised_prompt,
+                            flow_id=self._trace_flow_id(trace),
+                            trace=trace,
+                        )
+                    )
+                )
+                self._trace_stage(trace, "qq_delivery", status="succeeded")
             except Exception as exc:
+                self._trace_fail(trace, exc)
                 logger.error("GPT Image background delivery failed", exc_info=True)
                 try:
-                    await event.send(event.plain_result(f"{error_prefix}：{self._friendly_error(exc)}"))
+                    reply = await self._image_error_reply(event, exc, error_prefix)
+                    flow_id = self._trace_flow_id(trace)
+                    if flow_id:
+                        reply = f"流程ID：{flow_id}\n{reply}"
+                    await event.send(event.plain_result(reply))
                 except Exception:
                     logger.error("Failed to send GPT Image background error", exc_info=True)
 
@@ -1480,8 +2409,6 @@ class GPTImage2Plugin(Star):
         )
         normalized_resolution = self._normalize_resolution(resolution)
         if normalized_resolution != "auto":
-            if profile == "flexible" and normalized_resolution == "4k" and normalized_ratio not in VALID_4K_ASPECT_RATIOS:
-                normalized_resolution = "2k"
             payload["resolution"] = normalized_resolution
 
         normalized_quality = self._normalize_quality(quality)
@@ -1517,8 +2444,14 @@ class GPTImage2Plugin(Star):
             return False
         return True
 
-    async def _persona_aware_text_generation_prompt(self, event: AstrMessageEvent, prompt: str) -> str:
-        if not _text_generation_needs_persona(prompt):
+    async def _persona_aware_text_generation_prompt(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        force: bool = False,
+    ) -> str:
+        if not force and not _text_generation_needs_persona(prompt):
             return prompt
 
         persona_name, persona_prompt, persona_source = await self._resolve_image_persona_mask(event)
@@ -1917,6 +2850,10 @@ class GPTImage2Plugin(Star):
 
     def _prompt_enhance_provider(self) -> Provider | None:
         provider_id = self._str_cfg("prompt_enhance", "provider_id", "")
+        if not provider_id and self._bool_cfg("prompt_enhance", "use_global_image_caption_provider", True):
+            provider_id = self._global_image_caption_provider_id()
+            if provider_id:
+                logger.info("GPT Image prompt enhance using global image caption provider: %s", provider_id)
         if provider_id:
             provider = self.context.get_provider_by_id(provider_id)
             if not provider:
@@ -1929,6 +2866,15 @@ class GPTImage2Plugin(Star):
         if not isinstance(provider, Provider):
             raise RuntimeError(f"提示词增强模型提供商类型错误：{type(provider)}")
         return provider
+
+    def _global_image_caption_provider_id(self) -> str:
+        try:
+            config = self.context.get_config()
+            provider_settings = config.get("provider_settings", {}) if isinstance(config, dict) else {}
+            return str(provider_settings.get("default_image_caption_provider_id") or "").strip()
+        except Exception as exc:
+            logger.debug("GPT Image failed to read global image caption provider: %s", exc)
+        return ""
 
     def _prompt_translation_provider(self) -> Provider | None:
         provider_id = self._str_cfg("prompt", "translation_provider_id", "")
@@ -1945,7 +2891,12 @@ class GPTImage2Plugin(Star):
             raise RuntimeError(f"提示词英文化模型提供商类型错误：{type(provider)}")
         return provider
 
-    async def _translate_prompt_to_english(self, prompt: str) -> str:
+    async def _translate_prompt_to_english(
+        self,
+        prompt: str,
+        *,
+        max_output_chars: int | None = None,
+    ) -> str:
         provider = self._prompt_translation_provider()
         template = (
             self._str_cfg("prompt", "translation_template", "")
@@ -1973,7 +2924,12 @@ class GPTImage2Plugin(Star):
         translated = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
         if not translated:
             raise RuntimeError("提示词英文化模型没有返回有效内容")
-        max_chars = max(200, self._int_cfg("prompt", "translation_max_output_chars", 4000))
+        max_chars = max(
+            200,
+            max_output_chars
+            if max_output_chars is not None
+            else self._int_cfg("prompt", "translation_max_output_chars", 4000),
+        )
         translated = translated[:max_chars].rstrip()
         logger.info(
             "GPT Image prompt English translation done provider=%s output_len=%d",
@@ -2098,13 +3054,866 @@ class GPTImage2Plugin(Star):
 
         return "\n\n".join(parts).strip()
 
-    def _build_result_chain(self, image_path: str, revised_prompt: str | None) -> list[Any]:
+    def _build_result_chain(
+        self,
+        image_path: str,
+        revised_prompt: str | None,
+        *,
+        flow_id: str | None = None,
+        trace: dict[str, Any] | None = None,
+    ) -> list[Any]:
         del revised_prompt
-        return [Image.fromFileSystem(image_path)]
+        detail_text = self._build_result_detail_text(
+            image_path=image_path,
+            flow_id=flow_id,
+            trace=trace,
+        )
+        return [
+            Image.fromFileSystem(image_path),
+            Plain(f"\n{detail_text}"),
+        ]
 
-    def _tool_submitted_message(self, *, reference_count: int = 0) -> str:
+    def _build_result_detail_text(
+        self,
+        *,
+        image_path: str,
+        flow_id: str | None,
+        trace: dict[str, Any] | None,
+    ) -> str:
+        lines: list[str] = []
+        if flow_id:
+            lines.append(f"流程ID：{flow_id}")
+        lines.append(f"分辨率：{self._output_resolution_text(image_path)}")
+        elapsed_text = self._trace_elapsed_text(trace)
+        if elapsed_text:
+            lines.append(f"耗时：{elapsed_text}")
+        return "\n".join(lines)
+
+    def _output_resolution_text(self, image_path: str) -> str:
+        dimensions = self._image_dimensions(image_path)
+        if not dimensions:
+            return "未知"
+        width, height = dimensions
+        if width <= 0 or height <= 0:
+            return "未知"
+        return f"{width}x{height}"
+
+    def _trace_elapsed_text(self, trace: dict[str, Any] | None) -> str:
+        if not isinstance(trace, dict):
+            return ""
+        try:
+            created_at = float(trace.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        if created_at <= 0:
+            return ""
+        return self._format_elapsed_seconds(time.time() - created_at)
+
+    def _format_elapsed_seconds(self, seconds: float) -> str:
+        total = max(0, int(round(seconds)))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}小时{minutes}分{secs}秒"
+        if minutes:
+            return f"{minutes}分{secs}秒"
+        return f"{secs}秒"
+
+    def _tool_submitted_message(
+        self,
+        *,
+        reference_count: int = 0,
+        flow_id: str | None = None,
+        include_plan_hint: bool = False,
+    ) -> str:
         del reference_count
-        return "收到，开始画了，别催，如果等会提示报错喊老大排查"
+        message = "收到，开始画了，别催，如果等会提示报错喊老大排查"
+        if flow_id:
+            message += f"\n流程ID：{flow_id}"
+        if include_plan_hint:
+            message += "\n复杂需求可以用 /plan 进入高级画图模式。"
+        return message
+
+    def _plan_session_key(self, event: AstrMessageEvent) -> str:
+        group_id = self._event_identity_value(event, ("group_id",), ("get_group_id",))
+        sender_id = self._event_identity_value(event, ("sender_id", "user_id"), ("get_sender_id",))
+        session_id = self._event_identity_value(event, ("session_id",), ("get_session_id",))
+
+        if group_id:
+            return f"group:{group_id}:user:{sender_id or session_id or 'unknown'}"
+        return f"private:{sender_id or session_id or self._event_scope_key(event)}"
+
+    def _plan_owner_info(self, event: AstrMessageEvent) -> dict[str, str]:
+        group_id = self._event_identity_value(event, ("group_id",), ("get_group_id",))
+        sender_id = self._event_identity_value(event, ("sender_id", "user_id"), ("get_sender_id",))
+        session_id = self._event_identity_value(event, ("session_id",), ("get_session_id",))
+        owner_id = sender_id or session_id or "unknown"
+        if group_id:
+            label = f"群 {group_id} / QQ {owner_id}"
+            scope = "group"
+        else:
+            label = f"私聊 / QQ {owner_id}" if owner_id != "unknown" else "私聊 / 未知用户"
+            scope = "private"
+        return {
+            "scope": scope,
+            "group_id": group_id,
+            "sender_id": sender_id,
+            "session_id": session_id,
+            "owner_id": owner_id,
+            "label": label,
+        }
+
+    def _plan_owner_text(self, session: dict[str, Any] | None, event: AstrMessageEvent | None = None) -> str:
+        owner = session.get("owner") if isinstance(session, dict) else None
+        if isinstance(owner, dict):
+            label = str(owner.get("label") or "").strip()
+            if label:
+                return label
+        if event is not None:
+            return self._plan_owner_info(event).get("label", "未知用户")
+        return "未知用户"
+
+    def _mark_plan_event(self, event: AstrMessageEvent) -> bool:
+        now = time.time()
+        for key, handled_at in list(self._plan_handled_events.items()):
+            if now - handled_at > 30:
+                self._plan_handled_events.pop(key, None)
+
+        marker = self._tool_turn_key(event)
+        handled_at = self._plan_handled_events.get(marker)
+        if handled_at and now - handled_at < 5:
+            return False
+        self._plan_handled_events[marker] = now
+        return True
+
+    def _plan_session_ttl_seconds(self) -> int:
+        return max(0, self._int_cfg("plan", "session_ttl_seconds", 15 * 60))
+
+    def _cleanup_expired_plan_sessions(self, *, current_key: str | None = None) -> bool:
+        ttl = self._plan_session_ttl_seconds()
+        if ttl <= 0 or not current_key:
+            return False
+
+        now = time.time()
+        session = self._plan_sessions.get(current_key)
+        if not session:
+            return False
+        try:
+            updated_at = float(session.get("updated_at") or session.get("created_at") or 0)
+        except Exception:
+            updated_at = 0
+        if updated_at <= 0 or now - updated_at > ttl:
+            self._plan_sessions.pop(current_key, None)
+            return True
+        return False
+
+    def _plan_expired_text(self) -> str:
+        minutes = max(1, self._plan_session_ttl_seconds() // 60)
+        return f"当前 Image2 Studio Plan 已超过 {minutes} 分钟未更新，已自动退出。请重新用 /plan 开始。"
+
+    def _plan_help_text(self) -> str:
+        return (
+            "Image2 Studio Plan 模式：\n"
+            "/plan 画图需求 - 创建或补充高级画图计划\n"
+            "/plan status - 查看当前计划\n"
+            "/plan confirm - 确认并开始生成\n"
+            "/plan quit - 退出当前计划\n"
+            "可以在 /plan 消息里附带或引用参考图。"
+        )
+
+    def _plan_raw_prompt(self, session: dict[str, Any] | None) -> str:
+        if not isinstance(session, dict):
+            return ""
+        prompts = session.get("prompts") or []
+        if not isinstance(prompts, list):
+            return str(prompts or "").strip()
+        return "\n".join(str(item).strip() for item in prompts if str(item).strip()).strip()
+
+    def _merge_plan_options(self, session: dict[str, Any], opts: dict[str, Any]) -> None:
+        target = session.setdefault("options", {})
+        for key, value in (opts or {}).items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, bool) and value is False:
+                continue
+            target[key] = value
+
+    def _merge_plan_references(self, session: dict[str, Any], reference_paths: list[str]) -> None:
+        if not reference_paths:
+            return
+        target = session.setdefault("reference_image_paths", [])
+        seen = {os.path.abspath(str(path)) for path in target if path}
+        for path in reference_paths:
+            normalized = os.path.abspath(str(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            target.append(normalized)
+            if len(target) >= self._max_reference_images():
+                break
+
+    async def _refresh_plan_session(self, session: dict[str, Any], *, latest_prompt: str) -> None:
+        if not self._bool_cfg("plan", "enable_model_planning", True):
+            session["planned_prompt"] = self._plan_raw_prompt(session)
+            session["planned_response"] = self._fallback_plan_response(session)
+            session.pop("planning_error", None)
+            return
+
+        provider = self._plan_provider()
+        raw_prompt = self._plan_raw_prompt(session)
+        opts = session.get("options") or {}
+        refs = [
+            str(path)
+            for path in session.get("reference_image_paths", [])
+            if path and os.path.exists(str(path))
+        ][: self._max_reference_images()]
+        max_plan_images = max(0, self._int_cfg("plan", "max_reference_images", 4))
+        image_urls = refs[:max_plan_images] if max_plan_images else []
+        previous_plan = str(session.get("planned_response") or "").strip()
+        prompt = self._render_plan_prompt(
+            raw_prompt=raw_prompt,
+            latest_prompt=latest_prompt,
+            previous_plan=previous_plan,
+            options=self._format_plan_options(opts) or "默认",
+            reference_count=len(refs),
+        )
+        timeout = max(5, self._int_cfg("plan", "timeout_seconds", 60))
+        logger.info(
+            "Image2 Studio plan model start provider=%s refs=%d prompt_len=%d timeout=%s",
+            self._provider_label(provider),
+            len(image_urls),
+            len(raw_prompt),
+            timeout,
+        )
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=prompt,
+                session_id=f"image2-plan-{uuid.uuid4().hex}",
+                image_urls=image_urls,
+                persist=False,
+            ),
+            timeout=timeout,
+        )
+        planned_response = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
+        if not planned_response:
+            raise RuntimeError("Plan 模型没有返回有效内容")
+        max_chars = max(500, self._int_cfg("plan", "max_output_chars", 5000))
+        planned_response = planned_response[:max_chars].rstrip()
+        planned_prompt = self._extract_plan_final_prompt(planned_response) or raw_prompt
+        session["planned_response"] = planned_response
+        session["planned_prompt"] = planned_prompt
+        session["planned_at"] = time.time()
+        session.pop("planning_error", None)
+        logger.info(
+            "Image2 Studio plan model done provider=%s output_len=%d final_prompt_len=%d",
+            self._provider_label(provider),
+            len(planned_response),
+            len(planned_prompt),
+        )
+
+    def _plan_provider(self) -> Provider:
+        provider_id = self._str_cfg("plan", "provider_id", "")
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if not provider:
+                raise RuntimeError(f"没有找到 ID 为 {provider_id} 的 Plan 模型提供商")
+            if not isinstance(provider, Provider):
+                raise RuntimeError(f"Plan 模型提供商类型错误：{type(provider)}")
+            return provider
+
+        provider = self.context.get_using_provider()
+        if not isinstance(provider, Provider):
+            raise RuntimeError("当前默认模型提供商不可用，且未配置 Plan 模型 provider_id")
+        return provider
+
+    def _render_plan_prompt(
+        self,
+        *,
+        raw_prompt: str,
+        latest_prompt: str,
+        previous_plan: str,
+        options: str,
+        reference_count: int,
+    ) -> str:
+        template = self._str_cfg("plan", "prompt_template", "") or DEFAULT_PLAN_PROMPT_TEMPLATE
+        values = {
+            "raw_prompt": raw_prompt or "（无文字需求）",
+            "latest_prompt": latest_prompt or "（本次未追加文字，仅可能追加了参考图或参数）",
+            "previous_plan": previous_plan or "（暂无）",
+            "options": options or "默认",
+            "reference_count": str(reference_count),
+        }
+        rendered = template
+        for key, value in values.items():
+            rendered = rendered.replace("{" + key + "}", value)
+        if "{raw_prompt}" not in template:
+            rendered = f"{rendered.strip()}\n\n用户累计需求：\n{values['raw_prompt']}"
+        return rendered.strip()
+
+    def _extract_plan_final_prompt(self, planned_response: str) -> str:
+        text = self._clean_enhanced_prompt(planned_response)
+        if not text:
+            return ""
+
+        tag_match = re.search(r"<final_prompt>\s*(.*?)\s*</final_prompt>", text, flags=re.I | re.S)
+        if tag_match:
+            return self._clean_enhanced_prompt(tag_match.group(1))
+
+        marker_patterns = [
+            r"【最终提示词】\s*(.*?)(?=\n\s*【[^】]+】|\Z)",
+            r"最终提示词\s*[:：]\s*(.*?)(?=\n\s*(?:【[^】]+】|[^\n]{0,20}[:：])|\Z)",
+            r"Final Prompt\s*[:：]\s*(.*?)(?=\n\s*(?:[A-Z][A-Za-z ]{0,30}[:：]|【[^】]+】)|\Z)",
+        ]
+        for pattern in marker_patterns:
+            match = re.search(pattern, text, flags=re.I | re.S)
+            if match:
+                return self._clean_enhanced_prompt(match.group(1))
+        return ""
+
+    def _plan_final_prompt(self, session: dict[str, Any] | None) -> str:
+        if not isinstance(session, dict):
+            return ""
+        planned_prompt = str(session.get("planned_prompt") or "").strip()
+        if planned_prompt:
+            return planned_prompt
+        return self._extract_plan_final_prompt(str(session.get("planned_response") or ""))
+
+    def _fallback_plan_response(self, session: dict[str, Any], *, error: str = "") -> str:
+        raw_prompt = self._plan_raw_prompt(session)
+        refs = session.get("reference_image_paths") or []
+        opts = session.get("options") or {}
+        final_prompt = self._build_prompt(raw_prompt, opts.get("style"))
+        lines = []
+        if error:
+            lines.extend([f"（Plan 模型调用失败，先使用本地整理兜底：{error}）", ""])
+        lines.extend(
+            [
+                "【图像需求】",
+                raw_prompt or "（还没有文字需求）",
+                "",
+                "【参考图使用方式】",
+                f"参考图：{len(refs)} 张",
+                "",
+                "【最终提示词】",
+                final_prompt or raw_prompt or "（还没有最终提示词）",
+                "",
+                "【可修改项】",
+                "继续用 /plan 追加或修改主体、动作、构图、风格、尺寸、质量和参考图关系。",
+            ]
+        )
+        return "\n".join(lines).strip()
+
+    def _format_plan_session_status(self, session: dict[str, Any] | None) -> str:
+        if not session:
+            return self._plan_help_text()
+        raw_prompt = self._plan_raw_prompt(session)
+        refs = session.get("reference_image_paths") or []
+        opts = session.get("options") or {}
+        planned_response = str(session.get("planned_response") or "").strip()
+        if planned_response:
+            lines = [
+                "Image2 Studio Plan 已整理。",
+                f"所属：{self._plan_owner_text(session)}",
+                "",
+                planned_response,
+                "",
+                f"参考图：{len(refs)} 张",
+            ]
+            option_text = self._format_plan_options(opts)
+            if option_text:
+                lines.append(f"参数：{option_text}")
+            if session.get("planning_error"):
+                lines.append(f"提示：Plan 模型上次调用失败，当前展示为兜底整理。错误：{session.get('planning_error')}")
+            lines.extend(
+                [
+                    "",
+                    "继续修改：/plan 追加描述",
+                    "确认生成：/plan confirm",
+                    "退出：/plan quit",
+                ]
+            )
+            return "\n".join(lines).strip()
+        lines = [
+            "Image2 Studio Plan 已记录。",
+            f"所属：{self._plan_owner_text(session)}",
+            "",
+            "当前需求：",
+            raw_prompt or "（还没有文字需求）",
+            "",
+            f"参考图：{len(refs)} 张",
+        ]
+        option_text = self._format_plan_options(opts)
+        if option_text:
+            lines.extend(["参数：", option_text])
+        lines.extend(
+            [
+                "",
+                "继续补充：/plan 追加描述",
+                "确认生成：/plan confirm",
+                "退出：/plan quit",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _build_plan_session_chain(self, event: AstrMessageEvent, session: dict[str, Any]) -> list[Any]:
+        planned_response = str(session.get("planned_response") or "").strip()
+        if not planned_response:
+            return [Plain(self._format_plan_session_status(session))]
+
+        refs = session.get("reference_image_paths") or []
+        opts = session.get("options") or {}
+        params = self._format_plan_options(opts) or "默认"
+        status_text = (
+            "Image2 Studio Plan 已整理。"
+            f"\n所属：{self._plan_owner_text(session, event)}"
+            f"\n参考图：{len(refs)} 张"
+            f"\n参数：{params}"
+        )
+        if session.get("planning_error"):
+            status_text += f"\n提示：Plan 模型上次调用失败，当前展示为兜底整理。\n错误：{session.get('planning_error')}"
+
+        node_items: list[tuple[str, str]] = [("Plan 状态", status_text)]
+        node_items.extend(self._split_plan_response_sections(planned_response))
+        node_items.append(
+            (
+                "操作",
+                "继续修改：/plan 追加描述\n确认生成：/plan confirm\n退出：/plan quit",
+            )
+        )
+
+        try:
+            nodes = Nodes([])
+            self_id = str(event.get_self_id() or "0")
+            for title, text in node_items:
+                chunks = self._chunk_plan_node_text(text)
+                total = len(chunks)
+                for index, chunk in enumerate(chunks, start=1):
+                    node_title = title if total == 1 else f"{title} {index}/{total}"
+                    nodes.nodes.append(
+                        Node(
+                            uin=self_id,
+                            name=PLUGIN_DISPLAY_NAME,
+                            content=[Plain(f"{node_title}\n{chunk}")],
+                        )
+                    )
+            return [nodes]
+        except Exception:
+            logger.debug("Image2 Studio failed to build merged plan status nodes", exc_info=True)
+            return [Plain(self._format_plan_session_status(session))]
+
+    def _split_plan_response_sections(self, planned_response: str) -> list[tuple[str, str]]:
+        text = str(planned_response or "").strip()
+        if not text:
+            return []
+
+        sections: list[tuple[str, str]] = []
+        for match in re.finditer(r"【([^】]+)】\s*(.*?)(?=\n\s*【[^】]+】|\Z)", text, flags=re.S):
+            title = match.group(1).strip()
+            body = match.group(2).strip()
+            if title and body:
+                sections.append((title, body))
+        if sections:
+            return sections
+
+        return [("整理稿", text)]
+
+    def _chunk_plan_node_text(self, text: str, limit: int = 1600) -> list[str]:
+        source = str(text or "").strip()
+        if not source:
+            return ["（空）"]
+        if len(source) <= limit:
+            return [source]
+
+        chunks: list[str] = []
+        remaining = source
+        while len(remaining) > limit:
+            split_at = max(
+                remaining.rfind("\n\n", 0, limit),
+                remaining.rfind("\n", 0, limit),
+                remaining.rfind("。", 0, limit),
+                remaining.rfind("，", 0, limit),
+            )
+            if split_at < max(300, limit // 3):
+                split_at = limit
+            chunk = remaining[:split_at].strip()
+            if chunk:
+                chunks.append(chunk)
+            remaining = remaining[split_at:].strip()
+        if remaining:
+            chunks.append(remaining)
+        return chunks or ["（空）"]
+
+    def _format_plan_options(self, opts: dict[str, Any]) -> str:
+        labels = {
+            "size": "尺寸",
+            "aspect_ratio": "比例",
+            "resolution": "清晰度",
+            "quality": "质量",
+            "style": "风格",
+            "transparent_background": "透明背景",
+        }
+        parts: list[str] = []
+        for key in ("size", "aspect_ratio", "resolution", "quality", "style", "transparent_background"):
+            value = opts.get(key)
+            if value is None or value == "" or value is False:
+                continue
+            parts.append(f"{labels.get(key, key)}={value}")
+        return "，".join(parts)
+
+    async def _plan_mixed_prompt_preview(self, cn_prompt: str) -> str:
+        if not self._bool_cfg("prompt", "translate_to_english", False):
+            return cn_prompt
+        try:
+            preview_max_chars = max(
+                2000,
+                self._int_cfg("prompt", "translation_max_output_chars", 4000),
+                self._int_cfg("plan", "preview_translation_max_output_chars", 4000),
+            )
+            return await self._translate_prompt_to_english(
+                cn_prompt,
+                max_output_chars=preview_max_chars,
+            )
+        except Exception as exc:
+            logger.warning("Image2 Studio plan prompt preview translation failed: %s", self._friendly_error(exc))
+            return f"{cn_prompt}\n\n（英文/混合提示词预览失败，将按常规生成流程处理：{self._friendly_error(exc)}）"
+
+    def _build_plan_confirm_chain(
+        self,
+        event: AstrMessageEvent,
+        *,
+        trace: dict[str, Any],
+        raw_prompt: str,
+        cn_prompt: str,
+        mixed_prompt: str,
+        options: dict[str, Any],
+        reference_count: int,
+        owner_text: str = "",
+    ) -> list[Any]:
+        flow_id = self._trace_flow_id(trace) or "未知"
+        params = self._format_plan_options(options) or "默认"
+        operation = "改图/参考图生成" if reference_count else "文生图"
+        node_items = [
+            ("流程ID", f"流程ID：{flow_id}\n任务类型：{operation}\n所属：{owner_text or '未知用户'}"),
+            ("中文需求摘要", raw_prompt),
+            ("中文最终提示词", cn_prompt),
+            ("英文/混合最终提示词", mixed_prompt),
+            ("参数", f"参数：{params}\n参考图：{reference_count} 张"),
+        ]
+        try:
+            nodes = Nodes([])
+            self_id = str(event.get_self_id() or "0")
+            for title, text in node_items:
+                chunks = self._chunk_plan_node_text(text)
+                total = len(chunks)
+                for index, chunk in enumerate(chunks, start=1):
+                    node_title = title if total == 1 else f"{title} {index}/{total}"
+                    nodes.nodes.append(
+                        Node(
+                            uin=self_id,
+                            name=PLUGIN_DISPLAY_NAME,
+                            content=[Plain(f"{node_title}\n{chunk}")],
+                        )
+                    )
+            return [nodes]
+        except Exception:
+            logger.debug("Image2 Studio failed to build merged plan nodes", exc_info=True)
+            lines = ["高级画图计划已确认"]
+            for title, text in node_items:
+                lines.extend(["", f"【{title}】", text])
+            return [Plain("\n".join(lines))]
+
+    def _new_flow_id(self) -> str:
+        return f"gi-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+    def _trace_flow_id(self, trace: dict[str, Any] | None) -> str | None:
+        if not trace:
+            return None
+        flow_id = trace.get("flow_id")
+        return str(flow_id) if flow_id else None
+
+    def _new_image_trace(
+        self,
+        event: AstrMessageEvent,
+        *,
+        trigger: str,
+        operation: str,
+        raw_user_prompt: str,
+        prompt: str,
+        reference_image_paths: list[str] | None,
+        options: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        flow_id = self._new_flow_id()
+        trace: dict[str, Any] = {
+            "version": 1,
+            "flow_id": flow_id,
+            "status": "accepted",
+            "created_at": now,
+            "created_at_text": self._trace_time_text(now),
+            "updated_at": now,
+            "updated_at_text": self._trace_time_text(now),
+            "trigger": trigger,
+            "operation": operation,
+            "event": self._trace_event_info(event),
+            "raw_user_prompt": raw_user_prompt,
+            "initial_prompt": prompt,
+            "reference_images": [os.path.abspath(path) for path in (reference_image_paths or [])],
+            "options": options or {},
+            "stages": [],
+            "result": {},
+            "error": None,
+        }
+        self._trace_stage(
+            trace,
+            "accepted",
+            status="accepted",
+            raw_user_prompt=raw_user_prompt,
+            initial_prompt=prompt,
+        )
+        return trace
+
+    def _trace_route_decision(
+        self,
+        trace: dict[str, Any] | None,
+        *,
+        route: str,
+        reason: str,
+        operation: str,
+        reference_image_paths: list[str] | None = None,
+        **extra: Any,
+    ) -> None:
+        reference_image_paths = reference_image_paths or []
+        decision: dict[str, Any] = {
+            "route": route,
+            "reason": reason,
+            "operation": operation,
+            "used_reference_images": bool(reference_image_paths),
+            "reference_count": len(reference_image_paths),
+        }
+        decision.update(extra)
+        self._trace_update(trace, route_decision=decision)
+        self._trace_stage(trace, "route_decision", status="succeeded", **decision)
+
+    def _trace_stage(self, trace: dict[str, Any] | None, name: str, **data: Any) -> None:
+        if trace is None:
+            return
+        now = time.time()
+        stage = {
+            "name": name,
+            "at": now,
+            "at_text": self._trace_time_text(now),
+        }
+        stage.update(data)
+        trace.setdefault("stages", []).append(self._trace_jsonable(stage))
+        self._trace_update(trace)
+
+    def _trace_update(self, trace: dict[str, Any] | None, **fields: Any) -> None:
+        if trace is None:
+            return
+        for key, value in fields.items():
+            trace[key] = self._trace_jsonable(value)
+        now = time.time()
+        trace["updated_at"] = now
+        trace["updated_at_text"] = self._trace_time_text(now)
+        self._save_image_trace(trace)
+
+    def _trace_fail(self, trace: dict[str, Any] | None, exc: Exception) -> None:
+        if trace is None:
+            return
+        error = self._friendly_error(exc)
+        status = "delivery_failed" if trace.get("status") == "succeeded" and trace.get("result") else "failed"
+        self._trace_update(trace, status=status, error=error)
+
+    def _trace_time_text(self, timestamp: float) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+    def _trace_event_info(self, event: AstrMessageEvent) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "scope": self._event_scope_key(event),
+            "message_key": self._event_message_key(event),
+            "message_text": self._event_text(event),
+        }
+        message_obj = getattr(event, "message_obj", None)
+        for name in ("message_id", "msg_id", "group_id", "sender_id", "user_id", "session_id"):
+            value = getattr(message_obj, name, None)
+            if value:
+                info[name] = value
+        for name in ("get_group_id", "get_sender_id", "get_session_id"):
+            method = getattr(event, name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                logger.debug("Failed to read AstrBot event info for image trace", exc_info=True)
+                continue
+            if value:
+                info[name[4:]] = value
+        return self._trace_jsonable(info)
+
+    def _trace_response_metadata(self, response: Any) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        if isinstance(response, dict):
+            headers = response.get("_http_response_headers")
+            if isinstance(headers, dict):
+                metadata["headers"] = {str(key): str(value) for key, value in headers.items()}
+        return self._trace_jsonable(metadata)
+
+    def _trace_api_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        ignored_keys = {"image", "images", "file", "files"}
+        return {key: value for key, value in payload.items() if key not in ignored_keys}
+
+    def _trace_jsonable(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, BaseException):
+            return self._friendly_error(value)
+        if isinstance(value, dict):
+            return {str(key): self._trace_jsonable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._trace_jsonable(item) for item in value]
+        return str(value)
+
+    def _trace_path(self, flow_id: str) -> Path:
+        safe_id = self._normalize_flow_id(flow_id)
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", safe_id)
+        return self._trace_dir / f"{safe_id}.json"
+
+    def _normalize_flow_id(self, value: str) -> str:
+        text = (value or "").strip()
+        match = re.search(r"gi-\d{8}-\d{6}-[0-9a-fA-F]{8}", text)
+        if match:
+            return match.group(0)
+        return text
+
+    def _save_image_trace(self, trace: dict[str, Any]) -> None:
+        flow_id = self._trace_flow_id(trace)
+        if not flow_id:
+            return
+        try:
+            self._trace_dir.mkdir(parents=True, exist_ok=True)
+            path = self._trace_path(flow_id)
+            tmp_path = path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps(self._trace_jsonable(trace), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(path)
+        except Exception:
+            logger.warning("Failed to save GPT Image trace %s", flow_id, exc_info=True)
+
+    def _load_image_trace(self, flow_id: str) -> dict[str, Any] | None:
+        normalized = self._normalize_flow_id(flow_id)
+        if not normalized:
+            return None
+        path = self._trace_path(normalized)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Failed to load GPT Image trace %s", normalized, exc_info=True)
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _build_trace_result_chain(self, trace: dict[str, Any]) -> list[Any]:
+        chain: list[Any] = [Plain(self._format_trace_summary(trace))]
+        image_path = ((trace.get("result") or {}) if isinstance(trace.get("result"), dict) else {}).get("image_path")
+        if image_path and os.path.exists(str(image_path)):
+            chain.append(Image.fromFileSystem(str(image_path)))
+        return chain
+
+    def _format_trace_summary(self, trace: dict[str, Any]) -> str:
+        stages = trace.get("stages") if isinstance(trace.get("stages"), list) else []
+        preprocess = self._last_trace_stage(
+            stages,
+            ("description_reference_prompt", "persona_rewrite"),
+        )
+        enhance = self._last_trace_stage(stages, ("prompt_enhance",))
+        prompt_build = self._last_trace_stage(stages, ("prompt_build",))
+        compression = self._last_trace_stage(stages, ("prompt_compression",))
+        api_stage = self._last_trace_stage(stages, ("image_api",))
+        result = trace.get("result") if isinstance(trace.get("result"), dict) else {}
+
+        lines = [
+            f"流程ID：{trace.get('flow_id', '')}",
+            f"状态：{self._trace_status_label(str(trace.get('status', '')))}",
+            f"类型：{self._trace_operation_label(str(trace.get('operation', '')))}；入口：{trace.get('trigger', '')}",
+            f"创建时间：{trace.get('created_at_text', '')}",
+        ]
+        raw_prompt = self._clip_trace_text(trace.get("raw_user_prompt", ""))
+        initial_prompt = self._clip_trace_text(trace.get("initial_prompt", ""))
+        lines.append(f"原始需求：{raw_prompt}")
+        if initial_prompt and initial_prompt != raw_prompt:
+            lines.append(f"入口提示词：{initial_prompt}")
+        if preprocess:
+            output_prompt = self._clip_trace_text(preprocess.get("output_prompt", ""))
+            if output_prompt:
+                lines.append(f"预处理输出：{output_prompt}")
+        if enhance:
+            if enhance.get("status") == "failed":
+                lines.append(f"增强提示词：失败，{self._clip_trace_text(enhance.get('error', ''))}")
+            elif enhance.get("output_prompt"):
+                lines.append(f"增强提示词：{self._clip_trace_text(enhance.get('output_prompt', ''))}")
+        if prompt_build and prompt_build.get("output_prompt"):
+            lines.append(f"拼装后提示词：{self._clip_trace_text(prompt_build.get('output_prompt', ''))}")
+        if compression:
+            if compression.get("status") == "failed":
+                lines.append(f"关键词压缩：失败，{self._clip_trace_text(compression.get('error', ''))}")
+            elif compression.get("output_prompt"):
+                lines.append(f"关键词压缩后：{self._clip_trace_text(compression.get('output_prompt', ''))}")
+        if trace.get("final_prompt"):
+            lines.append(f"最终提交提示词：{self._clip_trace_text(trace.get('final_prompt', ''))}")
+        references = trace.get("reference_images") if isinstance(trace.get("reference_images"), list) else []
+        if references:
+            lines.append(f"参考图：{len(references)} 张")
+        if result.get("image_path"):
+            lines.append(f"输出图片：{result.get('image_path')}")
+        if result.get("revised_prompt"):
+            lines.append(f"接口修订提示词：{self._clip_trace_text(result.get('revised_prompt', ''))}")
+        if trace.get("error"):
+            lines.append(f"错误：{self._clip_trace_text(trace.get('error', ''), limit=600)}")
+        elif api_stage and api_stage.get("status") == "failed":
+            lines.append(f"接口错误：{self._clip_trace_text(api_stage.get('error', ''), limit=600)}")
+
+        text = "\n".join(str(line) for line in lines if str(line).strip())
+        if len(text) <= TRACE_QUERY_TEXT_LIMIT:
+            return text
+        return text[:TRACE_QUERY_TEXT_LIMIT].rstrip() + "\n……内容较长，完整记录已保存在 bot 机器的 traces 目录。"
+
+    def _last_trace_stage(self, stages: list[Any], names: tuple[str, ...]) -> dict[str, Any] | None:
+        for stage in reversed(stages):
+            if isinstance(stage, dict) and stage.get("name") in names:
+                return stage
+        return None
+
+    def _trace_status_label(self, status: str) -> str:
+        labels = {
+            "accepted": "已接收",
+            "running": "处理中",
+            "succeeded": "成功",
+            "failed": "失败",
+            "delivery_failed": "已生成但发送失败",
+        }
+        return labels.get(status, status or "未知")
+
+    def _trace_operation_label(self, operation: str) -> str:
+        if operation == "edit":
+            return "改图"
+        if operation == "generation":
+            return "生图"
+        return operation or "未知"
+
+    def _clip_trace_text(self, value: Any, *, limit: int = TRACE_PROMPT_PREVIEW_LIMIT) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "..."
 
     def _tool_request_key(
         self,
@@ -2172,6 +3981,50 @@ class GPTImage2Plugin(Star):
 
         return "|".join(dict.fromkeys(parts)) or "unknown-message"
 
+    def _event_identity_value(
+        self,
+        event: AstrMessageEvent,
+        attr_names: tuple[str, ...],
+        method_names: tuple[str, ...],
+    ) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        for name in attr_names:
+            value = getattr(message_obj, name, None)
+            if value:
+                return str(value)
+
+        for container in (getattr(message_obj, "sender", None), getattr(event, "sender", None)):
+            if not container:
+                continue
+            if isinstance(container, dict):
+                for name in (*attr_names, "user_id", "sender_id", "id", "qq", "uin"):
+                    value = container.get(name)
+                    if value:
+                        return str(value)
+            else:
+                for name in (*attr_names, "user_id", "sender_id", "id", "qq", "uin"):
+                    value = getattr(container, name, None)
+                    if value:
+                        return str(value)
+
+        for name in attr_names:
+            value = getattr(event, name, None)
+            if value:
+                return str(value)
+
+        for name in method_names:
+            method = getattr(event, name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                logger.debug("Failed to read AstrBot event identity value %s", name, exc_info=True)
+                continue
+            if value:
+                return str(value)
+        return ""
+
     def _event_scope_key(self, event: AstrMessageEvent) -> str:
         parts: list[str] = []
         for name in ("unified_msg_origin", "session_id"):
@@ -2221,42 +4074,10 @@ class GPTImage2Plugin(Star):
         ]
         if any(re.search(pattern, normalized) for pattern in prompt_only_patterns):
             return False
-
-        generation_patterns = [
-            r"(画|绘制|生成|生图|出图|出一张|做一张|做张|做一个|做个|来一张|来张).*(图|图片|图像|画|海报|头像|壁纸|图标|logo|贴纸|表情|插画|漫画|照片|场景)",
-            r"(\u518d\u751f\u6210|\u91cd\u65b0\u751f\u6210|\u91cd\u751f\u6210|\u7ee7\u7eed\u751f\u6210|\u751f\u6210).*(\u4e00\u904d|\u4e00\u6b21|\u5b89\u5168|\u52a8\u6f2b|\u5199\u5b9e|\u98ce\u683c|\u753b\u98ce|\u7248|\u56fe|\u56fe\u7247|\u63d2\u753b|\u573a\u666f)",
-            r"(\u518d\u753b|\u91cd\u65b0\u753b).+",
-            r"(\u518d\u6765|\u91cd\u65b0\u6765).*(\u4e00\u904d|\u4e00\u6b21|\u4e00\u5f20|\u5f20|\u56fe|\u56fe\u7247|\u7248|\u63d2\u753b|\u573a\u666f)",
-            r"(画|绘制)(一张|一个|个|只|幅|张).+",
-            r"(生成|做|设计|制作)(一张|一个|个|张).+",
-            r"(帮我|给我|替我).*(画|绘制|生成|生图|出图|做一张|做张|做一个|做个|来一张|来张)",
-            r"(设计|制作|做).*(一张|一个|个).*(图|图片|图像|海报|头像|壁纸|图标|logo|贴纸|表情|插画|漫画)",
-            r"^(画|绘制|生成|生图|出图|做一张|做张|做一个|做个|来一张|来张)",
-            r"(draw|generate|create|make|paint|design).*(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration|comic|scene)",
-            r"(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration).*(draw|generate|create|make|paint|design)",
-            r"(can|could|please|pls|wouldyou|canyou|couldyou|helpme).*(draw|paint).+",
-            r"(can|could|please|pls|wouldyou|canyou|couldyou|helpme).*(generate|create|make|design).*(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration|comic|scene)",
-            r"^(draw|paint)(a|an|the)?.+",
-            r"^(draw|generate|create|make|paint|design)(an?|the)?(image|picture|photo|poster|avatar|wallpaper|icon|logo|sticker|illustration|comic|scene)",
-            r"(画像|イラスト|写真|ポスター|アイコン|壁紙|ロゴ).*(描いて|生成|作成|作って|描く)",
-            r"(描いて|生成|作成|作って).*(画像|イラスト|写真|ポスター|アイコン|壁紙|ロゴ)",
-            r"(描いて|描く|生成して|作って|作成して)",
-        ]
-        edit_patterns = [
-            r"(改图|修图|p图|重绘|重画|重新画|扩图|扩展|延展|外扩|补图|补全|补完|补齐|抠图)",
-            r"(\u91cd\u753b|\u91cd\u7ed8|\u91cd\u65b0\u753b|\u6539\u753b|\u8f6c\u7ed8|\u6539\u6210|\u6539\u4e3a|\u53d8\u6210|\u53d8\u4e3a|\u8f6c\u6210|\u8f6c\u4e3a|\u505a\u6210).*(\u98ce\u683c|\u753b\u98ce|\u6750\u8d28|\u8d28\u611f|\u6548\u679c|\u6837\u5b50|\u624b\u529e|\u52a8\u6f2b|\u5199\u5b9e|3d|\u50cf\u7d20|\u6c34\u5f69|\u6cb9\u753b|\u4ea7\u54c1\u6e32\u67d3)",
-            r"(改|修|换|替换|去掉|删除|加上|添加|合成|参考|照着|补全|补完|补齐|扩展|延展|外扩).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照)",
-            r"(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
-            r"(给|帮|帮我|请).*(这张|上图|图片|图里|图中|照片|背景|主体|人物|文字|全身照).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|改成|改为|变成|变为|转成|转为|做成)",
-            r"(把|将).*(图|图片|照片|背景|主体|人物|文字).*(改|修|换|替换|去掉|删除|加上|添加|合成|重画|重绘|重新画|改画|补全|补完|补齐|扩展|延展|外扩|变成|变为|转成|做成)",
-            r"(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|cutout).*(this|the)?(image|picture|photo|background|subject|person|text)",
-            r"(this|the)?(image|picture|photo|background|subject|person|text).*(edit|modify|change|replace|remove|delete|add|combine|merge|redraw|expand|cutout)",
-            r"(画像|写真|背景|人物|文字).*(編集|修正|変更|置換|削除|追加|合成)",
-        ]
-
-        if use_reference_images:
-            return any(re.search(pattern, normalized) for pattern in edit_patterns + generation_patterns)
-        return any(re.search(pattern, normalized) for pattern in generation_patterns)
+        # The LLM has already chosen this tool. Do not re-run the old keyword
+        # router here, otherwise natural language requests can be blocked by a
+        # stale regex even when the model routed correctly.
+        return True
 
     def _event_text(self, event: AstrMessageEvent) -> str:
         try:
@@ -2344,7 +4165,8 @@ class GPTImage2Plugin(Star):
             if ":" in normalized or "：" in normalized:
                 opts["aspect_ratio"] = normalized.replace("：", ":")
             else:
-                opts["size"] = normalized
+                pixel_size = self._normalize_pixel_size(normalized)
+                opts["size"] = pixel_size or "auto"
             return
         if normalized in VALID_RESOLUTIONS:
             opts["resolution"] = normalized
@@ -2623,18 +4445,23 @@ class GPTImage2Plugin(Star):
         if explicit_size:
             return explicit_size
 
-        ratio = self._normalize_aspect_ratio(
-            aspect_ratio,
-            size=size,
-            reference_image_paths=reference_image_paths,
-            prefer_reference_ratio=prefer_reference_ratio,
-        )
-        if ratio != "auto":
-            return self._openai_size_for_ratio(ratio)
+        explicit_ratio = self._parse_aspect_ratio(aspect_ratio) or self._parse_aspect_ratio(size)
+        if explicit_ratio:
+            return self._openai_size_for_ratio(explicit_ratio)
+
+        if prefer_reference_ratio and reference_image_paths:
+            reference_size = self._reference_image_upstream_size(reference_image_paths[0])
+            if reference_size:
+                return reference_size
 
         configured_size = self._normalize_pixel_size(self._str_cfg("image", "size", "1024x1024"))
         if configured_size:
             return configured_size
+
+        configured_ratio = self._parse_aspect_ratio(self._str_cfg("image", "aspect_ratio", "auto"))
+        if configured_ratio:
+            return self._openai_size_for_ratio(configured_ratio)
+
         return "1024x1024"
 
     def _normalize_pixel_size(self, size: str | None) -> str:
@@ -2642,9 +4469,7 @@ class GPTImage2Plugin(Star):
         if not value or value == "auto":
             return ""
         value = value.replace("*", "x").replace(" ", "")
-        if value in VALID_OPENAI_SIZES:
-            return value
-        if re.fullmatch(r"\d{3,4}x\d{3,4}", value):
+        if value in VALID_UPSTREAM_IMAGE_SIZES:
             return value
         return ""
 
@@ -2717,6 +4542,21 @@ class GPTImage2Plugin(Star):
             return ""
         return self._nearest_supported_aspect_ratio(width / height)
 
+    def _reference_image_upstream_size(self, image_path: str) -> str:
+        size = self._image_dimensions(image_path)
+        if not size:
+            return ""
+        width, height = size
+        if width <= 0 or height <= 0:
+            return ""
+
+        ratio = width / height
+        if ratio >= REFERENCE_SQUARE_RATIO_MAX:
+            return REFERENCE_LANDSCAPE_SIZE
+        if ratio <= REFERENCE_SQUARE_RATIO_MIN:
+            return REFERENCE_PORTRAIT_SIZE
+        return REFERENCE_SQUARE_SIZE
+
     def _nearest_supported_aspect_ratio(self, ratio: float) -> str:
         candidates = [item for item in VALID_ASPECT_RATIOS if item != "auto"]
 
@@ -2778,8 +4618,6 @@ class GPTImage2Plugin(Star):
             return "1k"
         if value in {"2", "2k", "2048", "2048p"}:
             return "2k"
-        if value in {"4", "4k", "4096", "4096p"}:
-            return "4k"
         return value if value in VALID_RESOLUTIONS else "auto"
 
     def _image_dimensions(self, image_path: str) -> tuple[int, int] | None:
@@ -2861,6 +4699,55 @@ class GPTImage2Plugin(Star):
             height = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6))
             return width, height
         return None
+
+    def _apply_load_saving_options(
+        self,
+        *,
+        operation: str,
+        raw_user_prompt: str,
+        size: str | None,
+        resolution: str | None,
+        quality: str | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Drop model-suggested heavy params unless the user asked for them."""
+
+        prompt = (raw_user_prompt or "").lower()
+        explicit_heavy = bool(
+            re.search(r"\b[1248]\s*k\b", prompt)
+            or re.search(r"\d{3,4}\s*[x×]\s*\d{3,4}", prompt)
+            or any(
+                token in prompt
+                for token in (
+                    "高清",
+                    "高质量",
+                    "高分辨率",
+                    "精修",
+                    "精细",
+                    "细节拉满",
+                    "最终稿",
+                    "原图尺寸",
+                    "大图",
+                )
+            )
+        )
+        if explicit_heavy:
+            return size, resolution, quality
+
+        normalized_size = self._normalize_pixel_size(size)
+        if operation == "edit" and normalized_size in {
+            "2560x1440",
+            "1440x2560",
+            "2880x2880",
+            "3840x2160",
+            "2160x3840",
+        }:
+            size = None
+
+        if (resolution or "").strip().lower() == "2k":
+            resolution = None
+        if (quality or "").strip().lower() == "high":
+            quality = None
+        return size, resolution, quality
 
     def _normalize_quality(self, quality: str | None) -> str:
         value = (quality or "").strip().lower()
@@ -3002,6 +4889,18 @@ class GPTImage2Plugin(Star):
             return legacy
         return self._int_cfg("api", "timeout_seconds", DEFAULT_API_TIMEOUT)
 
+    def _base_url_prefers_standard_profile(self) -> bool:
+        base_url = self._base_url().lower()
+        standard_markers = (
+            "ruoli.dev",
+            "localhost:3000",
+            "127.0.0.1:3000",
+        )
+        private_host_pattern = r"https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}):3000(?:/|$)"
+        return any(marker in base_url for marker in standard_markers) or bool(
+            re.search(private_host_pattern, base_url)
+        )
+
     def _auto_detect_profile(
         self,
         *,
@@ -3016,7 +4915,7 @@ class GPTImage2Plugin(Star):
         the request with a parameter-format error the caller will retry once
         with the other profile.
         """
-        if "ruoli.dev" in self._base_url().lower():
+        if self._base_url_prefers_standard_profile():
             return "standard"
 
         # An explicit pixel size unambiguously speaks the strict OpenAI
@@ -3054,7 +4953,7 @@ class GPTImage2Plugin(Star):
         edit request that should follow the reference image is a stronger
         signal than whatever succeeded on an earlier request.
         """
-        if "ruoli.dev" in self._base_url().lower():
+        if self._base_url_prefers_standard_profile():
             return True
         if self._normalize_pixel_size(size):
             return True
@@ -3103,7 +5002,7 @@ class GPTImage2Plugin(Star):
                 if nested_response:
                     return nested_response
 
-            for key in ("images", "urls", "image_urls", "result_images"):
+            for key in ("results", "images", "urls", "image_urls", "result_images"):
                 nested_images = data.get(key)
                 if nested_images is not None:
                     nested_response = self._extract_image_response(nested_images)
@@ -3308,7 +5207,7 @@ class GPTImage2Plugin(Star):
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             return (
                 f"{action}：等待上游响应 {self._timeout_seconds()} 秒后超时。"
-                "图像生成本身较慢，可在配置里调高 api.timeout_seconds（建议 180-300），"
+                "4K 图像生成/改图本身较慢，可在配置里调高 api.timeout_seconds（建议 300-600），"
                 "或检查中转/网络是否可达。"
             )
         return f"{action}：网络连接失败：{self._friendly_error(exc)}"

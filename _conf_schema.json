@@ -39,21 +39,21 @@
   "image": {
     "description": "图片参数",
     "type": "object",
-    "hint": "size 是像素尺寸，resolution 是 1k/2k/4k 清晰度档位，aspect_ratio 是画面比例。命令或 LLM 工具里显式传参会覆盖默认值。",
+    "hint": "size 是实际像素尺寸，resolution 只保留 1k/2k 清晰度档位，aspect_ratio 是画面比例。当前上游实测 4K 需要使用 size=3840x2160 或 2160x3840。",
     "items": {
       "size": {
         "description": "默认像素尺寸",
         "type": "string",
         "default": "auto",
-        "options": ["auto", "1024x1024", "1536x1024", "1024x1536"],
-        "hint": "宽x高像素。auto 表示不主动传 size；方图 1024x1024，横图 1536x1024，竖图 1024x1536。部分兼容站支持更多像素尺寸。"
+        "options": ["auto", "1024x1024", "1536x1024", "1024x1536", "2560x1440", "1440x2560", "2880x2880", "3840x2160", "2160x3840"],
+        "hint": "宽x高像素。官方标准档：1024x1024、1536x1024、1024x1536；当前上游实测可用扩展档：2560x1440、1440x2560、2880x2880、3840x2160、2160x3840。3840x3840 和 4096x4096 已实测不支持。"
       },
       "resolution": {
         "description": "默认分辨率",
         "type": "string",
         "default": "1k",
-        "options": ["auto", "1k", "2k", "4k"],
-        "hint": "GPT 图像模型的清晰度档位。供应商支持时会生效；不支持时可能会忽略。"
+        "options": ["auto", "1k", "2k"],
+        "hint": "GPT 图像模型的清晰度档位。当前上游实测 resolution=4k 不会稳定返回真实 4K；需要 4K 请改用默认像素尺寸 3840x2160 或 2160x3840。"
       },
       "aspect_ratio": {
         "description": "默认比例",
@@ -226,7 +226,13 @@
         "type": "string",
         "default": "",
         "_special": "select_provider",
-        "hint": "填写一个支持视觉输入的模型 Provider ID，例如 grsai/gemini-3.1-pro。留空则使用当前默认对话模型。"
+        "hint": "填写一个支持视觉输入的模型 Provider ID，例如 本机反代/gpt-5.5。留空则使用当前默认对话模型。"
+      },
+      "use_global_image_caption_provider": {
+        "description": "Provider ID 留空时使用全局图片描述模型",
+        "type": "bool",
+        "default": true,
+        "hint": "仅影响 GPT Image 插件。提示词增强模型 Provider ID 留空时，优先读取 AstrBot 全局配置里的 default_image_caption_provider_id；仍为空时再使用当前默认对话模型。不会修改 stealer 插件。"
       },
       "mode": {
         "description": "增强模式",
@@ -293,6 +299,57 @@
       }
     }
   },
+  "plan": {
+    "description": "高级画图 Plan 模式",
+    "type": "object",
+    "hint": "/plan 阶段会先调用模型整理图像需求并回复确认稿；/plan confirm 才正式生成图片。",
+    "items": {
+      "enable_model_planning": {
+        "description": "启用模型整理",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，/plan 会先调用文本/视觉模型整理图像需求和最终提示词。关闭后只做本地记录。"
+      },
+      "provider_id": {
+        "description": "Plan 模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "可选。留空时使用当前默认对话模型。带参考图的 Plan 建议选择支持视觉输入的模型。"
+      },
+      "max_reference_images": {
+        "description": "Plan 阶段最多读取参考图数",
+        "type": "int",
+        "default": 4,
+        "slider": {"min": 0, "max": 16, "step": 1},
+        "hint": "仅影响 /plan 整理需求时发送给规划模型的参考图数量；正式生成仍按图片参数里的最多参考图数量。"
+      },
+      "timeout_seconds": {
+        "description": "Plan 模型超时秒数",
+        "type": "int",
+        "default": 60,
+        "hint": "规划模型的请求超时时间。带图理解较慢时可调高。"
+      },
+      "max_output_chars": {
+        "description": "Plan 输出最大字符数",
+        "type": "int",
+        "default": 5000,
+        "hint": "整理稿过长时会截断，避免消息和流程记录过大。"
+      },
+      "session_ttl_seconds": {
+        "description": "Plan 会话闲置超时秒数",
+        "type": "int",
+        "default": 900,
+        "hint": "同一个会话超过该时间没有继续 /plan、/plan status 或 /plan confirm，会自动退出。0 表示不自动过期。"
+      },
+      "prompt_template": {
+        "description": "Plan 整理模板",
+        "type": "string",
+        "default": "",
+        "hint": "可选。留空使用插件内置模板。可用变量：{raw_prompt} 累计需求，{latest_prompt} 本次追加，{previous_plan} 上一版整理稿，{options} 参数，{reference_count} 参考图数量。"
+      }
+    }
+  },
   "runtime": {
     "description": "运行设置",
     "type": "object",
@@ -303,6 +360,12 @@
         "type": "int",
         "default": 0,
         "hint": "0 表示工具立刻返回短句给模型，让模型按自己人设告诉用户；生成完成后自动发图。"
+      },
+      "enable_direct_keyword_trigger": {
+        "description": "启用关键词直接触发",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭后，自然语言生图/改图只由对话模型决定是否调用 Image2 工具；/生图、/改图、/plan 命令不受影响。建议保持关闭，避免关键词误触发。"
       },
       "max_concurrent": {
         "description": "图片生成并行数",
@@ -316,6 +379,13 @@
         "default": 1,
         "slider": {"min": 0, "max": 5, "step": 1},
         "hint": "仅用于下载图片等无副作用请求。生成/改图是 POST 任务提交，为避免超时后重复生成或重复扣费，插件不会自动重试这类请求。"
+      },
+      "image_request_retry_times": {
+        "description": "图片接口 POST 重试次数",
+        "type": "int",
+        "default": 2,
+        "slider": {"min": 0, "max": 5, "step": 1},
+        "hint": "对图片生成和图片修改的 POST 请求，在 HTTP 502/503/504 或网络瞬断时自动重试。数值越大越稳定，但也可能造成重复生成或重复扣费。"
       },
       "recent_reference_ttl_seconds": {
         "description": "最近参考图有效秒数",
