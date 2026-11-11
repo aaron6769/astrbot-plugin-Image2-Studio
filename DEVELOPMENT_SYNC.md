@@ -1,217 +1,64 @@
-# 开发与同步文档
+# 开发与安全同步
 
-本文档用于后续从运行中的 AstrBot 机器同步插件改动、脱敏后提交到 Git，以及从 Git 部署回 bot 机器。
+本文件说明本维护分支的源码同步规则。当前功能以 [README.md](README.md) 与代码为准，历史变更保留在 [GPT_Image插件本地修改记录.md](GPT_Image插件本地修改记录.md)。
 
-## 目录约定
+## 发布内容
 
-运行中的插件目录：
+运行时发布文件：
 
-```text
-/home/bot/qqbot/data/plugins/astrbot_plugin_gpt_image
-```
+- `main.py`、`__init__.py`
+- `_conf_schema.json`、`metadata.yaml`
+- `requirements.txt`
+- `logo.png`
+- `LICENSE`、`ARTWORK_NOTICE.md`
 
-AstrBot 容器内插件目录：
+README、变更记录、测试和 CI 配置用于说明、维护和验证。插件代码的 MIT 许可证不自动覆盖角色原设和第三方标识。
 
-```text
-/AstrBot/data/plugins/astrbot_plugin_gpt_image
-```
+## 同步原则
 
-本仓库只对应这个插件目录中的发布文件：
+1. 从已经测试的版本同步明确列出的发布文件，不复制整个服务器数据目录。
+2. 保留原作者署名。仓库元信息中的 `repo` 应指向当前维护仓库。
+3. 保持内部插件 ID、工具名和配置兼容性；显示名称变化不应重建用户数据。
+4. 所有模型、密钥和地址由使用者在自己的 AstrBot 实例配置。仓库不得包含私人供应商默认值。
+5. 原版与维护分支不要同时安装。已有部署应在原插件目录升级，并先备份配置。
+6. 保留既有提交历史，正常提交更新；不要为了公开而擅自重写历史。若发现历史中有真实密钥，应停止公开，先处理泄漏风险和轮换凭据。
 
-```text
-main.py
-_conf_schema.json
-metadata.yaml
-__init__.py
-LICENSE
-README.md
-DEVELOPMENT_SYNC.md
-GPT_Image插件本地修改记录.md
-.gitignore
-```
+## 关键行为约束
 
-## 当前核心改造
+- 无参考图的 LLM 工具提示词由当前 LLM 按会话人设组织，不注入插件固定自拍人设。
+- 参考图只来自本条消息或明确回复/引用；不能自动沿用最近图片。
+- 群聊必须明确 @机器人本体。
+- /plan 预览和提交使用同一份准备好的提示词；准备失败、过期或参考图失效时停止。
+- 流程记录只能由原请求者在原平台原会话访问；管理员跨会话排查仅限私聊。
+- 所选生图模型失效时明确报错，不自动切换其他供应商。
+- GIF 受独立开关控制，检查实际帧数和时长，不重提、不降级成静态图。
 
-### 群聊触发保护
-
-相关函数：
-
-- `_group_message_mentions_this_bot`
-- `_message_chain_mentions_bot`
-- `DirectReferenceImageEditFilter.filter`
-- `DirectTextImageGenerationFilter.filter`
-- `generate_command`
-- `edit_command`
-- `generate_image_with_gpt_image_2`
-
-规则：
-
-1. 私聊直接放行。
-2. 群聊必须检测到消息链里有 `At(qq=event.get_self_id())`。
-3. 未 @bot 的群消息不允许触发生图/改图。
-4. `@全体` 或 @其他人 不算。
-
-### 纯文字生图直通
-
-相关入口：
-
-- `DirectTextImageGenerationFilter`
-- `direct_text_image_generation_request`
-- `DIRECT_TEXT_GENERATION_PATTERNS`
-
-用途：
-
-群聊里用户已经 @bot，并且文本明确是“画一张、生成一张、来张、做一张”等纯文字生图请求时，插件直接启动图片生成任务，不再依赖对话模型自行决定是否调用 `generate_image_with_gpt_image_2`。
-
-注意：
-
-1. 群聊仍然必须 @bot。
-2. `/生图` 命令仍由命令处理器负责，直通入口会跳过 `/生图` 和 `/改图` 开头的文本。
-3. 如果消息里带图片或引用图片，交给参考图改图入口处理。
-
-### 提示词增强 placeholder 模式
-
-相关函数：
-
-- `_enhance_prompt_with_reference_images`
-- `_prompt_enhance_placeholder`
-- `_placeholder_fill_text`
-- `_with_placeholder_fill_instruction`
-- `_replace_prompt_placeholder`
-
-当前设计：
-
-1. `placeholder` 模式直接读取 `prompt_enhance.prompt_template`。
-2. 增强模型根据完整模板输出最终 prompt。
-3. 如果模板包含 `[在此处替换为您想要生成的主体内容]`，增强模型应把它替换为用户本次需求。
-4. 如果模型输出仍包含占位符，插件用用户原始请求兜底替换。
-5. `subject_prompt_template` 和 `final_prompt_template` 仅保留兼容旧配置，当前主流程不再使用。
-
-### 直接参考图改图
-
-相关入口：
-
-- `DirectReferenceImageEditFilter`
-- `direct_reference_image_edit_request`
-
-用途：
-
-当用户发送图片/引用图片并明确提出改图需求时，插件可以绕过对话模型直接启动图片任务，减少对话模型拦截导致的失败。
-
-注意：
-
-群聊里仍然必须 @bot。
-
-## 从运行机器同步到本仓库
-
-同步前先看：
-
-```text
-GPT_Image插件本地修改记录.md
-```
-
-后续本地改动以这个文件作为变更来源和核对清单。提交前需要确认记录里的改动已经体现在源码或 schema 中，并把“是否已同步到 Git”更新为已同步。
-
-先从运行机器复制当前容器内插件文件，避免宿主挂载权限或旧文件问题：
-
-```powershell
-scp bot@<BOT_HOST>:/home/bot/qqbot/data/plugins/astrbot_plugin_gpt_image/main.py .\main.py
-scp bot@<BOT_HOST>:/home/bot/qqbot/data/plugins/astrbot_plugin_gpt_image/_conf_schema.json .\_conf_schema.json
-scp bot@<BOT_HOST>:/home/bot/qqbot/data/plugins/astrbot_plugin_gpt_image/metadata.yaml .\metadata.yaml
-scp bot@<BOT_HOST>:/home/bot/qqbot/data/plugins/astrbot_plugin_gpt_image/__init__.py .\__init__.py
-scp bot@<BOT_HOST>:/home/bot/qqbot/data/plugins/astrbot_plugin_gpt_image/LICENSE .\LICENSE
-```
-
-同步后检查敏感信息：
-
-```powershell
-rg -n "sk-[A-Za-z0-9_-]+|tvly-[A-Za-z0-9_-]+|token\s*[:=]|api[_-]?key\s*[:=]|Bearer\s+[A-Za-z0-9._-]+|192\.168\.|100\." .
-```
-
-允许出现变量名，例如 `api_key`、`Authorization: Bearer {api_key}`；不允许出现真实 key、token、内网地址或个人环境信息。
-
-## 本地检查
-
-```powershell
-python -m py_compile .\main.py
-Get-Content -Encoding UTF8 .\_conf_schema.json | ConvertFrom-Json | Out-Null
-```
-
-## 部署到运行机器
-
-部署前备份：
-
-```powershell
-$ts = Get-Date -Format yyyyMMddHHmmss
-ssh bot@<BOT_HOST> "docker cp astrbot:/AstrBot/data/plugins/astrbot_plugin_gpt_image/main.py /home/bot/astrbot_plugin_gpt_image_main.py.bak.$ts"
-ssh bot@<BOT_HOST> "docker cp astrbot:/AstrBot/data/plugins/astrbot_plugin_gpt_image/_conf_schema.json /home/bot/astrbot_plugin_gpt_image_conf_schema.json.bak.$ts"
-```
-
-上传并写入容器：
-
-```powershell
-scp .\main.py bot@<BOT_HOST>:/home/bot/astrbot_plugin_gpt_image_main.py
-scp .\_conf_schema.json bot@<BOT_HOST>:/home/bot/astrbot_plugin_gpt_image_conf_schema.json
-ssh bot@<BOT_HOST> "docker cp /home/bot/astrbot_plugin_gpt_image_main.py astrbot:/AstrBot/data/plugins/astrbot_plugin_gpt_image/main.py"
-ssh bot@<BOT_HOST> "docker cp /home/bot/astrbot_plugin_gpt_image_conf_schema.json astrbot:/AstrBot/data/plugins/astrbot_plugin_gpt_image/_conf_schema.json"
-```
-
-容器内语法检查：
-
-```powershell
-ssh bot@<BOT_HOST> "docker exec astrbot python3 -m py_compile /AstrBot/data/plugins/astrbot_plugin_gpt_image/main.py"
-```
-
-重启：
-
-```powershell
-ssh bot@<BOT_HOST> "docker restart astrbot"
-```
-
-只看插件加载和错误过滤日志：
-
-```powershell
-ssh bot@<BOT_HOST> "docker logs --since 2m astrbot 2>&1 | grep -E 'astrbot_plugin_gpt_image|GPT Image|Traceback|ERROR|ERRO|WARN' | grep -v 'core.event_bus' | tail -100"
-```
-
-## Git 提交流程
+## 本地和 CI 检查
 
 ```bash
-git status --short
-git add main.py _conf_schema.json metadata.yaml __init__.py LICENSE README.md DEVELOPMENT_SYNC.md GPT_Image插件本地修改记录.md .gitignore
-git commit -m "Customize GPT Image plugin for AstrBot deployment"
-git push
+python -m py_compile main.py __init__.py
+python -m json.tool _conf_schema.json
+python -m unittest discover -s tests -v
+git diff --check
 ```
 
-提交前再次确认：
+仓库里的测试不需要 API Key，不会产生生图费用。这是静态与契约检查，不能替代安装到真实 AstrBot 后的功能回归。
 
-```bash
-git diff --cached --check
-git grep -n "sk-\|tvly-\|token\|Bearer \|192\.168\|100\."
-```
+行为变更应补充实际运行环境测试，至少覆盖模型选择、文生图、参考图、/plan 一致性、会话隔离和 GIF 开关。真实生图或发送消息测试须取得相应授权，避免打扰群聊或重复扣费。
 
-如果 `git grep` 只命中变量名和文档里的检查命令，可以提交；如果命中真实 key、token、IP 或用户信息，必须先删除。
+## 不应入库的内容
 
-## 回滚
+- 运行配置、环境变量文件、API Key、登录凭据、访问令牌或私钥
+- 用户 QQ 号、私聊或群聊原文、个人供应商名称、私网地址
+- 生成图片、参考图片、流程记录、缓存、数据库或服务日志
+- 运维脚本中包含的个人环境信息、回滚快照、密钥副本和备份包
 
-如果部署后插件异常：
+检查应同时覆盖工作区、暂存区和将要公开的历史分支/标签。模式扫描只能辅助发现问题，不等于绝对无敏感信息。
 
-```powershell
-ssh bot@<BOT_HOST> "docker cp /home/bot/astrbot_plugin_gpt_image_main.py.bak.<时间戳> astrbot:/AstrBot/data/plugins/astrbot_plugin_gpt_image/main.py"
-ssh bot@<BOT_HOST> "docker restart astrbot"
-```
+## 部署与回退
 
-如果配置 schema 也回滚：
+部署是仓库更新以外的独立操作。获得授权后，按「确认目标与空闲状态 → 测试 → 备份 → 更新 → 重载/重启 → 验证」执行。
 
-```powershell
-ssh bot@<BOT_HOST> "docker cp /home/bot/astrbot_plugin_gpt_image_conf_schema.json.bak.<时间戳> astrbot:/AstrBot/data/plugins/astrbot_plugin_gpt_image/_conf_schema.json"
-ssh bot@<BOT_HOST> "docker restart astrbot"
-```
+备份应包含完整插件目录和实际使用的配置，记录对应版本和校验值。更新后检查插件加载、后台页面、平台连接和原配置；出现异常时恢复已核验的备份，不覆盖期间出现的未知用户修改。
 
-## 维护原则
-
-- 不在仓库里保存任何运行配置和密钥。
-- 插件逻辑改动尽量集中在 `main.py`，WebUI 配置字段说明同步改 `_conf_schema.json`。
-- 先在测试群或私聊验证，再部署到长期运行的 bot。
-- 对会产生费用的图片任务，优先加触发条件和去重保护。
-- 任何会影响群聊自动触发的改动，都要再次验证“未 @ 不触发，@bot 才触发”。
+仓库公开不等于已上架 AstrBot 插件市场；发布到市场需要另行完成平台提交与素材许可确认。

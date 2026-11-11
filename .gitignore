@@ -15,3 +15,17 @@ images/
 config.json
 *_config.json
 
+# Credentials and local operations artifacts
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.bundle
+backups/
+rollback/
+traces/
+ops/
+.pytest_cache/
+test-results.txt
+

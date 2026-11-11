@@ -1,7 +1,7 @@
 name: astrbot_plugin_gpt_image_2
-desc: Image2 Studio：自然对话生图、改图、流程追踪与 /plan 高级画图
-display_name: Image2 Studio
-version: 1.3.0
+desc: 自然对话画图、参考图编辑、Plan 高级画图与可控 GIF；复用 AstrBot 模型配置。
+display_name: GPT Image · 龙绘
+version: 1.4.1
 author: starmiaoa
-repo: "https://github.com/starmiaoa/astrbot-plugin-gpt-image"
-astrbot_version: ">=4.0.0"
+repo: "https://github.com/aaron6769/astrbot-plugin-Image2-Studio"
+astrbot_version: ">=4.29.4"

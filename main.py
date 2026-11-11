@@ -20,14 +20,16 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
-from astrbot.api import llm_tool, logger, sp
+from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.core.message.components import Node, Nodes
@@ -39,7 +41,7 @@ from astrbot.core.utils.quoted_message import extract_quoted_message_images
 
 PLUGIN_ID = "astrbot_plugin_gpt_image_2"
 TOOL_NAME = "generate_image_with_gpt_image_2"
-PLUGIN_DISPLAY_NAME = "Image2 Studio"
+PLUGIN_DISPLAY_NAME = "GPT Image · 龙绘"
 
 MAX_GPT_IMAGE_REFERENCE_IMAGES = 16
 MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024
@@ -78,7 +80,7 @@ VALID_ASPECT_RATIOS = {
 }
 VALID_RESOLUTIONS = {"auto", "1k", "2k"}
 VALID_QUALITIES = {"auto", "low", "medium", "high"}
-VALID_OUTPUT_FORMATS = {"png", "jpeg", "webp"}
+VALID_OUTPUT_FORMATS = {"png", "jpeg", "webp", "gif"}
 VALID_BACKGROUNDS = {"auto", "transparent", "opaque"}
 VALID_INPUT_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
 TRANSIENT_HTTP_STATUSES = {408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526}
@@ -194,12 +196,8 @@ DESCRIPTION_REFERENCE_GENERATION_PATTERNS = [
     r"(draw|generate|create|make).*(from|basedon|accordingto).*(text|description|prompt).*(image|picture|photo)",
 ]
 
-PERSONA_REQUEST_HELPER_PATTERNS = [
-    r"(你给我|你帮我|请你|麻烦你|帮我|给我|替我).{0,8}(画|绘制|生成|生图|出图|做|设计|制作)",
-    r"(canyou|couldyou|please|helpme).{0,8}(draw|generate|create|make|paint|design)",
-]
-
-PERSONA_REFERENTIAL_TEXT_PATTERNS = [
+DIALOG_CONTEXT_TEXT_PATTERNS = [
+    r"(自拍|自画像|人设|人格|本体|selfie|persona|自撮り)",
     r"(画|绘制|生成|生图|出图|做|设计|制作|来).{0,8}(你自己|妳自己|你|妳|你的|妳的|本体|本人|人设|人格|设定|形象|自拍|自画像)",
     r"(你自己|妳自己|你的|妳的|本体|本人|人设|人格|设定|形象).{0,12}(图|图片|照片|头像|壁纸|海报|自拍|自画像|全身照|半身照)",
     r"(自拍|自画像).{0,8}(你|妳|bot|机器人|本体|人设|形象)",
@@ -237,6 +235,8 @@ def _direct_text_looks_like_discussion_or_question(normalized: str) -> bool:
 
 
 def _direct_reference_text_allows_image_edit(text: str) -> bool:
+    if _text_requests_gif(text):
+        return False
     normalized = _normalized_request_text(text)
     if not normalized:
         return False
@@ -289,40 +289,18 @@ def _description_reference_text_allows_image_generation(text: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in DESCRIPTION_REFERENCE_GENERATION_PATTERNS)
 
 
-def _text_generation_needs_persona(text: str) -> bool:
+def _text_requests_gif(text: str) -> bool:
+    return bool(re.search(r"(?<![a-z])gif(?![a-z])|动图|动态表情|动态贴纸|动画", str(text or ""), flags=re.I))
+
+
+def _text_generation_needs_dialog_context(text: str) -> bool:
+    """Leave contextual subjects and animation parameters to the dialogue."""
+    if _text_requests_gif(text):
+        return True
     normalized = _normalized_request_text(text)
     if not normalized:
         return False
-    if any(re.search(pattern, normalized) for pattern in PERSONA_REQUEST_HELPER_PATTERNS):
-        explicit_self_reference = any(
-            marker in normalized
-            for marker in (
-                "画你",
-                "画一下你",
-                "画个你",
-                "画一个你",
-                "画你的",
-                "生成你",
-                "生成你的",
-                "做你",
-                "做你的",
-                "你自己",
-                "你的自拍",
-                "你的形象",
-                "你的本体",
-                "本体",
-                "人设",
-                "自画像",
-                "yourself",
-                "your selfie",
-                "yourselfie",
-                "your persona",
-                "your avatar",
-            )
-        )
-        if not explicit_self_reference:
-            return False
-    return any(re.search(pattern, normalized) for pattern in PERSONA_REFERENTIAL_TEXT_PATTERNS)
+    return any(re.search(pattern, normalized) for pattern in DIALOG_CONTEXT_TEXT_PATTERNS)
 
 
 def _message_chain_has_image_or_reply(chain: Any) -> bool:
@@ -474,6 +452,9 @@ class DirectTextImageGenerationFilter(filter.CustomFilter):
             return False
 
         text = _safe_event_text(event)
+        # Let the current conversation resolve who a selfie/persona refers to.
+        if _text_generation_needs_dialog_context(text):
+            return False
         try:
             message_chain = event.get_messages()
         except Exception:
@@ -562,13 +543,7 @@ NON_PROFILE_ERROR_KEYWORDS = (
     "does not exist",
 )
 
-# Defaults for the merged ``api`` config block. Used by ``_new_api_active`` to
-# tell whether the user has actually filled in the new block or is still on
-# the auto-populated schema defaults (in which case we should fall back to
-# the legacy ``openai`` / ``two_api`` blocks).
-DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_API_MODEL = "gpt-image-2"
-DEFAULT_API_TIMEOUT = 180
+DEFAULT_API_TIMEOUT = 300
 
 # aiohttp's default User-Agent looks like ``Python/3.x aiohttp/3.y``. Some
 # middlemen place broad Cloudflare rules in front of API endpoints that block
@@ -635,17 +610,21 @@ DEFAULT_TOOL_GUIDE = """
 什么时候调用：
 - 群聊里只有用户明确 @ 你时才可以调用；未 @ 你的群消息即使包含图片、改图、重绘、生图等关键词，也不要调用。
 - 只有用户明确要求你现在输出一张图片时才调用 例如“画一张...”“生成一张图...”“出图...”“做一张海报/头像/壁纸/图标...”；“再生成一遍”也算明确出图。
-- 只有用户明确要求修改图片 且当前消息或引用消息里有图片时才设置 `use_reference_images=true` 例如“改这张图...”“把图里的...换成...”“参考上图生成...”；“改成动漫画风”“重画成手办材质”也算明确改图。
+- 只有用户明确要求修改或参考图片 且当前消息或明确引用消息里有图片时才设置 `use_reference_images=true` 例如“改这张图...”“把图里的...换成...”“参考这张图生成...”；“改成动漫画风”“重画成手办材质”也算明确改图。
+- `use_reference_images=false` 就是纯文生图，不会因“改图”等关键词自动带图。之前未明确引用的聊天图片不会被自动沿用；要使用旧图，请用户回复/引用那张图或重新附图。
 - 如果用户想改图但没有发图或引用图 不要调用工具 先请用户发送或引用图片。
-- 有参考图或引用图时 如果用户明确要求改图、重绘、参考图生成、按图中文字/描述生成 就必须调用工具；你不需要也不应该在调用工具前评价图片内容、分析是否擦边、改写成安全方案或拒绝。
-- 参考图不需要你完整复述进 `prompt`；`prompt` 写用户要改什么/生成什么即可，插件会自动收集当前消息和引用消息里的图片，并交给后续提示词增强模型读取参考图细节。
+- 有参考图或引用图时，结合用户要求判断是改图、重绘、参考图生成，还是按图中文字/描述生成，并选择对应参数。
+- 参考图不需要你完整复述进 `prompt`；`prompt` 写用户要改什么/生成什么即可。仅在 `use_reference_images=true` 时，插件收集本条消息和明确引用消息里的图片，并交给后续提示词增强模型读取参考图细节。
 - 如果用户只是讨论图片 询问建议 写提示词 改提示词 翻译提示词 分析图片风格 规划设计方案 询问参数或问能不能生成 不要调用工具 直接用文字回答。
-- 对话模型只负责路由识别：判断是否是明确的生图/改图请求。不要基于图片内容、服装、姿势、场景或历史记忆在调用工具前做安全拒绝、道德评价、擦边判断或安全版改写；把用户原始需求传给工具，插件的提示词增强和图像上游会处理参考图细节与接口安全边界。
+- 对话模型负责识别明确的生图/改图意图，并结合本轮对话选定画面主体、组织完整视觉提示词。插件负责提交任务，不会替无参考图的工具请求重新选择主体或套用固定人设。
 - 用户表达不明确时不要主动生成 先用文字确认是否需要现在出图。
 - 同一条用户消息最多调用一次工具 先生成一张图 除非用户后续继续要求修改或再生成 不要在同一轮对话里重复调用
 
 参数怎么传：
-- `prompt` 写完整、具体、可独立理解的视觉需求。改图时说明用户要保留什么、改变什么、参考图之间的关系；尽量保留用户原始改图意图，不要在工具调用前把请求改成安全替代方案或拒绝话术。
+- 用户明确要求原生 GIF 动图时，设置 `output_format="gif"`；`frame_count` 为 2–16 帧，`frame_duration_ms` 为每帧 20–2000 毫秒（越小越快，按 10 毫秒规整）。未指定时使用配置默认 9 帧、200 毫秒；不要自行增加帧数。GIF 的 `size` 可为 `auto` 或宽高均为 16 的倍数，例如 `512x512`；不要传 `aspect_ratio` 或 `resolution`，它们只用于静态图。本插件当前 GIF 入口仅支持纯文字生成，不支持参考图或改图；遇到这种请求请说明插件限制，不要丢弃参考图偷偷改为纯文字生成。未要求动图时不要设置 gif。
+- `prompt` 写完整、具体、可独立理解的视觉需求。改图时说明用户要保留什么、改变什么、参考图之间的关系。
+- 主体由你根据用户本轮要求和对话语境选定。只有用户明确要求画当前 bot 的“你、你的自拍、你的形象、本体”等形象时，才从本轮实际生效的人格组织可见外观、服装、表情、姿态、场景和风格，并完整写入 `prompt`。不要只写“你”或人格名称。
+- 用户指定其他人物或角色时，包括其他人的自拍，必须保留指定主体，不得因为“自拍、形象、人设”等关键词套用 bot 的形象。无参考图时插件直接使用这份 `prompt`，仅追加显式 `style`，不再做人设改写、提示词增强、英文化或统一前后缀拼接。
 - `resolution` 只用于 `1k`/`2k` 清晰度档位；当前上游实测 `resolution=4k` 不会稳定返回真实 4K，所以用户要 4K 时请改用 `size`。
 - `aspect_ratio` 是画面比例：文生图时请根据用途主动选择最合适比例，例如头像/图标 `1:1`，海报/手机壁纸 `9:16`，电脑壁纸/横版海报 `16:9`，产品横幅 `21:9`，普通横图 `3:2`，普通竖图 `2:3`；如果用户明确要求比例就按用户要求传。改图时除非用户明确要求新比例，否则留空，插件会尽量按第一张参考图比例。
 - `size` 是精确像素尺寸。可用档位：`1024x1024`、`1536x1024`、`1024x1536`、`2560x1440`、`1440x2560`、`2880x2880`、`3840x2160`、`2160x3840`。用户要 4K 横图用 `3840x2160`，4K 竖图用 `2160x3840`。
@@ -681,66 +660,6 @@ DEFAULT_PROMPT_ENHANCE_TEMPLATE = """
 
 DEFAULT_PROMPT_SUBJECT_PLACEHOLDER = "[在此处替换为您想要生成的主体内容]"
 
-DEFAULT_PROMPT_SUBJECT_TEMPLATE = """
-你是图像编辑需求提取器。请根据用户原始消息、工具改写提示词和参考图片，提取一段应该填入固定绘图母版占位符里的“主体/目标内容”。
-
-用户原始消息：
-{raw_user_prompt}
-
-工具改写提示词：
-{user_prompt}
-
-工具传入的额外风格参数：
-{style}
-
-参考图片数量：
-{image_count}
-
-请遵守：
-1. 只输出要填入占位符的主体/目标描述，不要输出完整绘图提示词。
-2. 如果用户要求“替换/换成/改成某人物或主体”，重点描述新主体的身份、外观、服装、姿态、表情、风格和必须出现的标志性元素。
-3. 如果用户要求保留文字、保留构图、保留背景或保留姿势，请把这些和主体相关的硬要求简洁写入描述。
-4. 不要编造用户没有要求的新文字、logo、水印、剧情或额外角色。
-5. 不要解释，不要 Markdown，不要代码块。
-""".strip()
-
-DEFAULT_PROMPT_PLACEHOLDER_TEMPLATE = """
-Edit the provided reference image. Treat the reference image as the image to modify, not just as style inspiration.
-
-Replace only the requested main subject/person/foreground character with:
-[在此处替换为您想要生成的主体内容]
-
-Hard constraints:
-- Preserve the original composition, camera angle, framing, perspective, aspect ratio, background, lighting direction, atmosphere, depth of field, and overall layout as much as possible.
-- Keep all non-target objects, scenery, background figures, readable text, logos, signs, UI, and environmental details unchanged unless the user explicitly asks to change them.
-- If the reference image contains text and the user asks to keep text, keep the text clear, readable, and in the same approximate position.
-- Remove or transform the original target subject; do not leave the old subject visible as an extra character.
-- Do not add new watermarks, captions, random text, extra characters, or unrelated story elements.
-- The result should look like a local edit of the provided image rather than a completely new image.
-""".strip()
-
-DEFAULT_SELF_PERSONA_REWRITE_TEMPLATE = """
-你是图像生成提示词改写器。用户正在让当前 bot 根据插件内配置的人设生成图像。
-
-插件内人设名称：
-{persona_name}
-
-插件内人设/视觉设定：
-{persona_prompt}
-
-用户原始生图请求：
-{user_prompt}
-
-请把用户请求改写成一段可以直接提交给图像生成模型的中文提示词。
-
-要求：
-1. 必须根据“插件内人设/视觉设定”提炼 bot 的可视化形象、气质、服装、表情、姿态和画面氛围。
-2. 如果用户说“你、你的、自己、自拍、全身照、本体、形象”等，指的就是插件内配置的 bot 形象。
-3. 保留用户请求里的画幅、视角、动作、风格、数量和限制。
-4. 如果人设没有明确外貌，请根据设定气质做合理视觉化，但不要加入无关角色、文字、logo、水印或剧情。
-5. 只输出最终图像提示词，不要解释，不要 Markdown，不要代码块。
-""".strip()
-
 DEFAULT_PROMPT_TRANSLATION_TEMPLATE = """
 You are an image prompt localization and rewriting assistant.
 
@@ -760,7 +679,7 @@ Requirements:
 
 
 DEFAULT_PLAN_PROMPT_TEMPLATE = """
-你是 Image2 Studio 的高级画图规划助手。用户正在使用 /plan 模式，此阶段只整理图像需求，不要生成图片，不要拒绝，不要输出闲聊。
+你是 GPT Image · 龙绘 的高级画图规划助手。用户正在使用 /plan 模式，此阶段只整理图像需求，不要生成图片，不要拒绝，不要输出闲聊。
 
 用户累计需求：
 {raw_prompt}
@@ -796,13 +715,31 @@ DEFAULT_PLAN_PROMPT_TEMPLATE = """
 @register(
     PLUGIN_ID,
     "starmiaoa",
-    "Image2 Studio：自然对话生图、改图、流程追踪与 /plan 高级画图",
-    "1.3.0",
+    "GPT Image · 龙绘：自然对话生图、改图、流程追踪与 /plan 高级画图",
+    "1.4.1",
 )
 class GPTImage2Plugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
+        # Keep legacy keys in the schema until AstrBot has loaded and migrated
+        # them. Its integrity check otherwise removes old keys before __init__.
+        if self.config.get("_config_version", 0) == 0:
+            old_image = self.config.get("image", {})
+            gif = self.config.setdefault("gif", {})
+            for old_key, new_key, default in (
+                ("gif_frame_count", "frame_count", 9),
+                ("gif_frame_duration_ms", "frame_duration_ms", 200),
+            ):
+                if old_key in old_image and gif.get(new_key, default) == default:
+                    gif[new_key] = old_image[old_key]
+            if old_image.get("output_format") == "gif" and gif.get("size", "auto") == "auto":
+                gif["size"] = old_image.get("size", "auto")
+            # The new opt-in switch remains off for old and new installations.
+            # Never infer official API access from a model name or hostname.
+            self.config["_config_version"] = 1
+            if callable(getattr(self.config, "save_config", None)):
+                self.config.save_config()
         self._data_dir = StarTools.get_data_dir()
         self._image_dir = self._data_dir / "images"
         self._image_dir.mkdir(parents=True, exist_ok=True)
@@ -816,7 +753,6 @@ class GPTImage2Plugin(Star):
         self._inflight_tool_turns: dict[str, asyncio.Task[tuple[str, str | None]]] = {}
         self._inflight_tool_traces: dict[str, dict[str, Any]] = {}
         self._inflight_tool_turn_traces: dict[str, dict[str, Any]] = {}
-        self._recent_reference_images: dict[str, tuple[float, list[str]]] = {}
         self._plan_sessions: dict[str, dict[str, Any]] = {}
         self._plan_handled_events: dict[str, float] = {}
         # In-memory cache of the compat profile that succeeded last time for a
@@ -842,7 +778,7 @@ class GPTImage2Plugin(Star):
             ).stop_event()
             return
 
-        image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
+        image_prompt = prompt
         trace = self._new_image_trace(
             event,
             trigger="/生图",
@@ -859,14 +795,6 @@ class GPTImage2Plugin(Star):
             operation="generation",
             reference_image_paths=[],
         )
-        if image_prompt != prompt:
-            self._trace_stage(
-                trace,
-                "persona_rewrite",
-                status="succeeded",
-                input_prompt=prompt,
-                output_prompt=image_prompt,
-            )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=image_prompt,
@@ -877,6 +805,9 @@ class GPTImage2Plugin(Star):
                 quality=opts.get("quality"),
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
+                output_format=opts.get("output_format"),
+                frame_count=opts.get("frame_count"),
+                frame_duration_ms=opts.get("frame_duration_ms"),
                 trace=trace,
             )
         )
@@ -899,7 +830,10 @@ class GPTImage2Plugin(Star):
             ).stop_event()
             return
 
-        reference_paths = await self._collect_reference_image_paths(event)
+        reference_source_records: list[dict[str, str]] = []
+        reference_paths = await self._collect_reference_image_paths(
+            event, stabilize=True, source_records=reference_source_records,
+        )
         if not reference_paths:
             yield event.plain_result("没有找到可用参考图。请在同一条消息里发图，或回复/引用一张图后再使用 /改图。").stop_event()
             return
@@ -920,6 +854,11 @@ class GPTImage2Plugin(Star):
             operation="edit",
             reference_image_paths=reference_paths,
         )
+        self._trace_stage(
+            trace, "reference_selection", status="succeeded",
+            policy="current_or_explicit_quote_only", sources=reference_source_records,
+            selected_paths=reference_paths,
+        )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=prompt,
@@ -930,6 +869,9 @@ class GPTImage2Plugin(Star):
                 quality=opts.get("quality"),
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
+                output_format=opts.get("output_format"),
+                frame_count=opts.get("frame_count"),
+                frame_duration_ms=opts.get("frame_duration_ms"),
                 reference_image_paths=reference_paths,
                 trace=trace,
             )
@@ -938,11 +880,93 @@ class GPTImage2Plugin(Star):
         event.stop_event()
         yield event.plain_result(self._tool_submitted_message(reference_count=len(reference_paths), flow_id=self._trace_flow_id(trace)))
 
+    @filter.command("绘图")
+    async def native_draw_command(self, event: AstrMessageEvent):
+        prompt = self._extract_command_prompt(event, ("绘图",)).strip()
+        opts, prompt = self._parse_inline_options(prompt)
+        if not prompt:
+            yield event.plain_result(
+                "用法：/绘图 提示词（可同消息发送或引用参考图）。这个命令会原样提交提示词，不做增强、翻译或压缩。"
+            ).stop_event()
+            return
+
+        reference_source_records: list[dict[str, str]] = []
+        reference_paths = await self._collect_reference_image_paths(
+            event,
+            include_recent=False,
+            stabilize=True,
+            source_records=reference_source_records,
+        )
+        operation = "edit" if reference_paths else "generation"
+        trace = self._new_image_trace(
+            event,
+            trigger="/绘图",
+            operation=operation,
+            raw_user_prompt=prompt,
+            prompt=prompt,
+            reference_image_paths=reference_paths,
+            options={**opts, "native_passthrough": True},
+        )
+        self._trace_route_decision(
+            trace,
+            route="native_image_edit" if reference_paths else "native_text_to_image",
+            reason="explicit_native_draw_command",
+            operation=operation,
+            reference_image_paths=reference_paths,
+            native_passthrough=True,
+        )
+        self._trace_stage(
+            trace, "reference_selection", status="succeeded",
+            policy="current_or_explicit_quote_only", sources=reference_source_records,
+            selected_paths=reference_paths,
+        )
+        task = asyncio.create_task(
+            self._generate_image(
+                prompt=prompt,
+                raw_user_prompt=prompt,
+                size=opts.get("size"),
+                aspect_ratio=opts.get("aspect_ratio"),
+                resolution=opts.get("resolution"),
+                quality=opts.get("quality"),
+                style=opts.get("style"),
+                transparent_background=opts.get("transparent_background", False),
+                output_format=opts.get("output_format"),
+                frame_count=opts.get("frame_count"),
+                frame_duration_ms=opts.get("frame_duration_ms"),
+                reference_image_paths=reference_paths,
+                trace=trace,
+                skip_prompt_enhance=True,
+                skip_prompt_translation=True,
+                raw_prompt_passthrough=True,
+            )
+        )
+        self._schedule_background_delivery(
+            event,
+            task,
+            error_prefix="图片修改失败" if reference_paths else "图片生成失败",
+            trace=trace,
+        )
+        event.stop_event()
+        yield event.plain_result(self._tool_submitted_message(flow_id=self._trace_flow_id(trace)))
+
     @filter.custom_filter(DirectTextImageGenerationFilter)
     async def direct_text_image_generation_request(self, event: AstrMessageEvent):
         prompt = self._event_text(event)
         opts, prompt = self._parse_inline_options(prompt)
         if not prompt:
+            return
+        # Do not intercept requests whose subject needs conversation context.
+        if _text_generation_needs_dialog_context(prompt):
+            return
+        try:
+            render_options = self._resolve_render_options(
+                output_format=opts.get("output_format"), frame_count=opts.get("frame_count"),
+                frame_duration_ms=opts.get("frame_duration_ms"), size=opts.get("size"),
+                aspect_ratio=opts.get("aspect_ratio"), resolution=opts.get("resolution"),
+            )
+        except Exception as exc:
+            event.stop_event()
+            yield event.plain_result(f"图片参数不可用：{self._friendly_error(exc)}")
             return
         description_reference_paths: list[str] = []
         description_reference_texts: list[str] = []
@@ -951,6 +975,10 @@ class GPTImage2Plugin(Star):
             description_reference_texts = self._collect_reference_description_texts(event)
 
         preprocess_stage: dict[str, Any] | None = None
+        if render_options["output_format"] == "gif" and description_reference_paths:
+            event.stop_event()
+            yield event.plain_result("本插件的 GIF 动图目前仅支持纯文字生成，不支持参考图；本次不会丢弃参考图或调用描述模型。")
+            return
         if description_reference_paths or description_reference_texts:
             try:
                 image_prompt = await self._enhance_prompt_from_description_reference(
@@ -980,14 +1008,7 @@ class GPTImage2Plugin(Star):
             yield event.plain_result("没有找到可用的引用图片或引用文字。请引用包含描述文字的图片后再说“按这个描述生成一张图”。")
             return
         else:
-            image_prompt = await self._persona_aware_text_generation_prompt(event, prompt)
-            if image_prompt != prompt:
-                preprocess_stage = {
-                    "name": "persona_rewrite",
-                    "status": "succeeded",
-                    "input_prompt": prompt,
-                    "output_prompt": image_prompt,
-                }
+            image_prompt = prompt
 
         turn_key = self._tool_turn_key(event)
         turn_task = self._inflight_tool_turns.get(turn_key)
@@ -1010,6 +1031,7 @@ class GPTImage2Plugin(Star):
             style=opts.get("style"),
             transparent_background=opts.get("transparent_background", False),
             reference_paths=[],
+            render_options=render_options,
         )
         existing_task = self._inflight_tool_tasks.get(request_key)
         if existing_task and not existing_task.done():
@@ -1035,9 +1057,6 @@ class GPTImage2Plugin(Star):
         if description_reference_paths or description_reference_texts:
             route = "image_description_generation"
             reason = "description_reference_context"
-        elif preprocess_stage and preprocess_stage.get("name") == "persona_rewrite":
-            route = "persona_generation"
-            reason = "persona_text_generation"
         self._trace_route_decision(
             trace,
             route=route,
@@ -1060,6 +1079,7 @@ class GPTImage2Plugin(Star):
                 quality=opts.get("quality"),
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
+                render_options=render_options,
                 trace=trace,
             )
         )
@@ -1078,25 +1098,13 @@ class GPTImage2Plugin(Star):
 
         task.add_done_callback(_clear_inflight)
         logger.info(
-            "GPT Image direct text generation intercepted before LLM prompt_len=%d final_prompt_len=%d persona=%s",
+            "GPT Image direct text generation intercepted before LLM prompt_len=%d final_prompt_len=%d",
             len(prompt),
             len(image_prompt),
-            _text_generation_needs_persona(prompt),
         )
         self._schedule_background_delivery(event, task, error_prefix="图片生成失败", trace=trace)
         event.stop_event()
         yield event.plain_result(self._tool_submitted_message(flow_id=self._trace_flow_id(trace)))
-
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=9500)
-    async def remember_recent_reference_images(self, event: AstrMessageEvent) -> None:
-        try:
-            paths = await self._collect_reference_image_paths(event, include_recent=False)
-        except Exception:
-            logger.debug("GPT Image failed to cache recent reference images", exc_info=True)
-            return
-        if paths:
-            self._remember_recent_reference_images(event, paths)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=9600)
@@ -1114,18 +1122,35 @@ class GPTImage2Plugin(Star):
             if not _message_chain_has_image_or_reply(message_chain):
                 return
 
-        logger.info("Image2 Studio Plan prefix guard intercepted plan-like message")
+        logger.info("GPT Image · 龙绘 Plan prefix guard intercepted plan-like message")
         async for result in self._handle_image2_plan(event, payload):
             yield result
 
     @filter.custom_filter(DirectReferenceImageEditFilter)
     async def direct_reference_image_edit_request(self, event: AstrMessageEvent):
         prompt = self._event_text(event)
+        if _text_requests_gif(prompt):
+            return
         opts, prompt = self._parse_inline_options(prompt)
         if not prompt:
             return
 
-        reference_paths = await self._collect_reference_image_paths(event)
+        try:
+            render_options = self._resolve_render_options(
+                output_format=opts.get("output_format"), frame_count=opts.get("frame_count"),
+                frame_duration_ms=opts.get("frame_duration_ms"), size=opts.get("size"),
+                aspect_ratio=opts.get("aspect_ratio"), resolution=opts.get("resolution"),
+                reference_image_paths=["requested-reference"],
+            )
+        except Exception as exc:
+            event.stop_event()
+            yield event.plain_result(f"图片参数不可用：{self._friendly_error(exc)}")
+            return
+
+        reference_source_records: list[dict[str, str]] = []
+        reference_paths = await self._collect_reference_image_paths(
+            event, stabilize=True, source_records=reference_source_records,
+        )
         if not reference_paths:
             event.stop_event()
             yield event.plain_result(
@@ -1159,6 +1184,7 @@ class GPTImage2Plugin(Star):
             style=opts.get("style"),
             transparent_background=opts.get("transparent_background", False),
             reference_paths=reference_paths,
+            render_options=render_options,
         )
         existing_task = self._inflight_tool_tasks.get(request_key)
         if existing_task and not existing_task.done():
@@ -1191,6 +1217,11 @@ class GPTImage2Plugin(Star):
             operation="edit",
             reference_image_paths=reference_paths,
         )
+        self._trace_stage(
+            trace, "reference_selection", status="succeeded",
+            policy="current_or_explicit_quote_only", sources=reference_source_records,
+            selected_paths=reference_paths,
+        )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=prompt,
@@ -1202,6 +1233,7 @@ class GPTImage2Plugin(Star):
                 style=opts.get("style"),
                 transparent_background=opts.get("transparent_background", False),
                 reference_image_paths=reference_paths,
+                render_options=render_options,
                 trace=trace,
             )
         )
@@ -1236,15 +1268,16 @@ class GPTImage2Plugin(Star):
     @filter.command("生图帮助")
     async def gptimage_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "Image2 Studio 已加载。\n"
-            "命令：/生图 提示词；/改图 提示词（同消息发图，或回复/引用图片）。\n"
+            "GPT Image · 龙绘 已加载。\n"
+            "命令：/生图 提示词；/改图 提示词（同消息发图，或回复/引用图片）；/绘图 提示词（原样直通，不增强不翻译）。\n"
             "高级模式：/plan 进入多轮确认式画图；/plan confirm 确认生成；/plan quit 退出。\n"
             "参数：--resolution 1k|2k，--ratio 1:1|16:9|9:16|3:2|2:3，"
             "--size 1024x1024|1536x1024|1024x1536|2560x1440|1440x2560|2880x2880|3840x2160|2160x3840|auto，"
             "--quality auto|low|medium|high，--style 风格，--transparent。\n"
+            "GIF 动图：--format gif --frames 9 --frame-ms 200 --size 512x512；2–16 帧，每帧 20–2000 毫秒。本插件目前仅支持纯文字 GIF，不支持参考图、--ratio 或 --resolution。需供应商已开放原生 GIF。\n"
             "说明：像素尺寸用 --size，清晰度档位用 --resolution，比例用 --ratio。\n"
-            f"多图参考：GPT 图像编辑接口最多支持 {MAX_GPT_IMAGE_REFERENCE_IMAGES} 张参考图。\n"
-            "查询：/生图流程 流程ID，可查看这次请求每个节点的提示词和生成结果。"
+            f"多图参考：最多 {MAX_GPT_IMAGE_REFERENCE_IMAGES} 张，只使用本条消息或明确引用的图片；修改之前的图片请回复/引用它。\n"
+            "查询：/生图流程 流程ID，优先查看实际提交提示词和结果；仅原请求者在原会话可查，管理员跨会话排查请私聊。"
         ).stop_event()
 
     @filter.command("plan")
@@ -1266,7 +1299,7 @@ class GPTImage2Plugin(Star):
         if normalized in {"quit", "cancel", "exit", "退出", "取消", "结束"}:
             existed = self._plan_sessions.pop(key, None)
             event.stop_event()
-            yield event.plain_result("已退出 Image2 Studio Plan 模式。" if existed else "当前没有正在进行的 Plan。")
+            yield event.plain_result("已退出 GPT Image · 龙绘 Plan 模式。" if existed else "当前没有正在进行的 Plan。")
             return
 
         if normalized in {"status", "状态", "查看"}:
@@ -1275,7 +1308,15 @@ class GPTImage2Plugin(Star):
             if expired_current:
                 yield event.plain_result(self._plan_expired_text())
                 return
+            if session and session.get("planning"):
+                yield event.plain_result("当前计划正在整理，请稍候再查看状态。")
+                return
             if session and str(session.get("planned_response") or "").strip():
+                try:
+                    await self._prepare_plan_submission(session)
+                except Exception as exc:
+                    yield event.plain_result(f"最终提示词准备失败，尚未提交生图；请用 /plan status 查看或重试：{self._friendly_error(exc)}")
+                    return
                 yield event.chain_result(self._build_plan_session_chain(event, session))
             else:
                 yield event.plain_result(self._format_plan_session_status(session) if session else self._plan_help_text())
@@ -1297,15 +1338,34 @@ class GPTImage2Plugin(Star):
                 yield event.plain_result("这个 Plan 还没有画图需求。用 /plan 补充你想画什么，再 /plan confirm。")
                 return
 
+            if session.get("confirming") or session.get("planning"):
+                event.stop_event()
+                yield event.plain_result("当前计划正在准备，请稍候再查看状态；不会重复提交生图。")
+                return
+
             opts = dict(session.get("options") or {})
             planned_prompt = self._plan_final_prompt(session) or raw_prompt
-            reference_paths = [
-                str(path)
-                for path in session.get("reference_image_paths", [])
-                if path and os.path.exists(str(path))
-            ][: self._max_reference_images()]
-            cn_prompt = self._build_prompt(planned_prompt, opts.get("style"))
-            mixed_prompt = await self._plan_mixed_prompt_preview(cn_prompt)
+            session["confirming"] = True
+            try:
+                expected_fingerprint = self._plan_submission_fingerprint(session)
+                reference_paths = self._validated_plan_reference_paths(session)
+                prepared = await self._prepare_plan_submission(session)
+                if (
+                    self._plan_sessions.get(key) is not session
+                    or self._cleanup_expired_plan_sessions(current_key=key)
+                    or session.get("planning")
+                    or self._plan_submission_fingerprint(session) != expected_fingerprint
+                ):
+                    raise RuntimeError("准备期间计划已修改、退出或过期，请查看最新计划后重新确认")
+                reference_paths = self._validated_plan_reference_paths(session)
+            except Exception as exc:
+                event.stop_event()
+                yield event.plain_result(f"最终提示词准备失败，尚未提交生图；请查看当前计划后重试 /plan confirm：{self._friendly_error(exc)}")
+                return
+            finally:
+                session.pop("confirming", None)
+            cn_prompt = prepared["chinese_prompt"]
+            mixed_prompt = prepared["final_prompt"]
             trace = self._new_image_trace(
                 event,
                 trigger="/plan confirm",
@@ -1323,6 +1383,12 @@ class GPTImage2Plugin(Star):
                 reference_image_paths=reference_paths,
             )
             self._trace_stage(
+                trace, "reference_selection", status="succeeded",
+                policy="current_or_explicit_quote_only",
+                sources=[record for record in session.get("reference_sources", []) if record.get("path") in reference_paths],
+                selected_paths=reference_paths,
+            )
+            self._trace_stage(
                 trace,
                 "plan_confirm",
                 status="succeeded",
@@ -1335,7 +1401,7 @@ class GPTImage2Plugin(Star):
             )
             task = asyncio.create_task(
                 self._generate_image(
-                    prompt=planned_prompt,
+                    prompt=mixed_prompt,
                     raw_user_prompt=raw_prompt,
                     size=opts.get("size"),
                     aspect_ratio=opts.get("aspect_ratio"),
@@ -1346,6 +1412,11 @@ class GPTImage2Plugin(Star):
                     reference_image_paths=reference_paths,
                     trace=trace,
                     skip_prompt_enhance=True,
+                    skip_prompt_translation=True,
+                    raw_prompt_passthrough=True,
+                    advanced=True,
+                    expected_image_selection=prepared["image_selection"],
+                    render_options=prepared["render_options"],
                 )
             )
             self._schedule_background_delivery(
@@ -1371,7 +1442,13 @@ class GPTImage2Plugin(Star):
             return
 
         opts, prompt = self._parse_inline_options(text)
-        reference_paths = await self._collect_reference_image_paths(event, include_recent=False)
+        reference_source_records: list[dict[str, str]] = []
+        reference_paths = await self._collect_reference_image_paths(
+            event,
+            include_recent=False,
+            stabilize=True,
+            source_records=reference_source_records,
+        )
         session = self._plan_sessions.get(key)
         if not session:
             session = {
@@ -1387,22 +1464,53 @@ class GPTImage2Plugin(Star):
 
         if prompt:
             session.setdefault("prompts", []).append(prompt)
+        session.pop("prepared_submission", None)
         self._merge_plan_options(session, opts)
         self._merge_plan_references(session, reference_paths)
+        source_by_path = {record["path"]: record for record in session.get("reference_sources", []) if record.get("path")}
+        source_by_path.update({record["path"]: record for record in reference_source_records if record.get("path")})
+        session["reference_sources"] = [
+            source_by_path[path] for path in session.get("reference_image_paths", []) if path in source_by_path
+        ]
         session["updated_at"] = time.time()
+        session["revision"] = int(session.get("revision", 0)) + 1
+        revision = session["revision"]
 
         event.stop_event()
         if not self._plan_raw_prompt(session) and not session.get("reference_image_paths"):
             yield event.plain_result(self._plan_help_text())
             return
         try:
+            self._freeze_plan_render_options(session)
+        except Exception as exc:
+            yield event.plain_result(f"Plan 参数不可用，尚未调用模型或提交生图：{self._friendly_error(exc)}")
+            return
+        session["planning"] = True
+        try:
             await self._refresh_plan_session(session, latest_prompt=prompt)
         except Exception as exc:
+            if session.get("revision") != revision or self._plan_sessions.get(key) is not session:
+                yield event.plain_result("计划已更新或退出，本次旧整理结果已丢弃。")
+                return
             fallback_prompt = self._plan_raw_prompt(session)
             session["planned_prompt"] = fallback_prompt
             session["planned_response"] = self._fallback_plan_response(session, error=self._friendly_error(exc))
             session["planning_error"] = self._friendly_error(exc)
-            logger.warning("Image2 Studio plan model failed; fallback to local plan: %s", self._friendly_error(exc), exc_info=True)
+            logger.warning("GPT Image · 龙绘 plan model failed; fallback to local plan: %s", self._friendly_error(exc), exc_info=True)
+        finally:
+            if session.get("revision") == revision:
+                session.pop("planning", None)
+        if self._plan_sessions.get(key) is not session:
+            yield event.plain_result("计划已退出，本次整理结果已丢弃。")
+            return
+        try:
+            await self._prepare_plan_submission(session)
+        except Exception as exc:
+            yield event.plain_result(f"最终提示词准备失败，尚未提交生图；请用 /plan status 查看或重试：{self._friendly_error(exc)}")
+            return
+        if self._plan_sessions.get(key) is not session:
+            yield event.plain_result("计划已退出，本次整理结果已丢弃。")
+            return
         if str(session.get("planned_response") or "").strip():
             yield event.chain_result(self._build_plan_session_chain(event, session))
         else:
@@ -1416,8 +1524,8 @@ class GPTImage2Plugin(Star):
             return
 
         trace = self._load_image_trace(flow_id)
-        if not trace:
-            yield event.plain_result(f"没有找到这个生图流程：{flow_id}").stop_event()
+        if not trace or not self._can_access_image_trace(event, trace):
+            yield event.plain_result("无法查询该流程。请由原请求者在原会话查询，或由 AstrBot 管理员私聊查询。").stop_event()
             return
 
         yield event.chain_result(self._build_trace_result_chain(trace)).stop_event()
@@ -1430,8 +1538,8 @@ class GPTImage2Plugin(Star):
             return
 
         trace = self._load_image_trace(flow_id)
-        if not trace:
-            yield event.plain_result(f"没有找到这个生图流程：{flow_id}").stop_event()
+        if not trace or not self._can_access_image_trace(event, trace):
+            yield event.plain_result("无法查询该流程。请由原请求者在原会话查询，或由 AstrBot 管理员私聊查询。").stop_event()
             return
 
         yield event.chain_result(self._build_trace_result_chain(trace)).stop_event()
@@ -1448,20 +1556,29 @@ class GPTImage2Plugin(Star):
         style: str = "",
         transparent_background: bool = False,
         use_reference_images: bool = False,
+        output_format: str = "",
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
     ):
         """Generate or edit an image with a GPT image model and send it to the current chat.
 
         Use this tool only when the user explicitly asks you to generate or edit an
         image now. Set use_reference_images=true only when the user wants to edit,
-        transform, combine, or follow images attached to the current message or quoted/replied
-        message. Do not use it for normal text-only answers, prompt writing, design
+        transform, combine, or follow images attached to the current message or explicitly
+        quoted/replied message. Earlier unquoted chat images are never selected.
+        Set false for text-only generation; edit-related words will not override false.
+        Do not use it for normal text-only answers, prompt writing, design
         advice, image discussion, parameter questions, or ambiguous requests.
-        Your role before calling this tool is routing only: decide whether this is
-        an image generation/editing request. Do not inspect the image or prompt for
-        safety, do not refuse, and do not rewrite the request into a safer
-        alternative before the tool call. Pass the user's requested edit/generation
-        intent to the tool; plugin prompt enhancement and the image upstream handle
-        reference-image details and interface safety boundaries.
+        Resolve the requested subject from the user's request and current conversation,
+        then write a complete visual prompt. Only when the user explicitly asks for
+        the current bot's selfie, avatar, body, or persona should you derive visible
+        character details from the persona active in this turn. Do not pass only a
+        persona name or a vague reference such as "yourself". Other people's selfies
+        must keep those people as the subjects, never the bot's persona.
+        Without reference images, the plugin submits your prompt without persona
+        rewriting, enhancement, translation, or configured prefix/suffix templates;
+        an explicit style parameter is appended deterministically. With reference
+        images, the existing reference-image prompt enhancement remains available.
 
         Call this tool at most once for one user message. The tool sends the finished image directly to the user. After the tool reports
         background-task status, respond in your persona and naturally let the user know
@@ -1471,13 +1588,16 @@ class GPTImage2Plugin(Star):
 
         Args:
             prompt(string): Required. A complete, concrete image prompt describing subject, style, composition, colors, lighting, text to include if any, and constraints from the user.
-            size(string): Optional. Pixel size for OpenAI official/compatible APIs. Use one of: auto, 1024x1024, 1536x1024, 1024x1536, 2560x1440, 1440x2560, 2880x2880, 3840x2160, 2160x3840. Use 3840x2160 for 4K landscape and 2160x3840 for 4K portrait.
-            aspect_ratio(string): Optional. Desired aspect ratio, such as 1:1, 16:9, 9:16, 3:2, 2:3, 21:9. For text-to-image, choose the best ratio for the user's intended use when they do not specify one. For image editing, leave empty unless the user asks to change the ratio; the plugin will prefer the first reference image's ratio.
-            resolution(string): Optional. GPT image resolution tier: auto, 1k, or 2k. Do not use resolution=4k; use size=3840x2160 or size=2160x3840 for real 4K output on the current upstream.
+            size(string): Optional. For static images use auto, 1024x1024, 1536x1024, 1024x1536, 2560x1440, 1440x2560, 2880x2880, 3840x2160, or 2160x3840. GIF supports auto or positive width and height divisible by 16, such as 256x256 or 512x512, without static-image size remapping.
+            aspect_ratio(string): Optional for static images. Desired aspect ratio, such as 1:1, 16:9, 9:16, 3:2, 2:3, 21:9. For static text-to-image, choose the best ratio for the intended use. For edits, leave empty unless the user asks to change it. For GIF always leave empty or auto; use size instead.
+            resolution(string): Optional for static images: auto, 1k, or 2k. Do not use resolution=4k; use size=3840x2160 or size=2160x3840. For GIF always leave empty or auto; use size instead.
             quality(string): Optional. Image quality: auto, low, medium, or high. Use high only when the user asks for detailed/final artwork.
             style(string): Optional. Extra visual style words such as realistic, anime, watercolor, product render, poster, pixel art, or flat icon.
             transparent_background(boolean): Optional. Set true for logos, stickers, icons, UI assets, transparent cutouts, or when the user asks for no background.
-            use_reference_images(boolean): Optional. Set true for image editing/image-to-image requests using images in the current or quoted message. Up to 16 images are used.
+            use_reference_images(boolean): Optional. Set true only to use images attached to this message or explicitly quoted/replied by it. False keeps text-to-image even when the prompt mentions editing. Earlier unquoted images are never used; if true has no selected images, ask the user to attach or quote them. Up to 16 images are used.
+            output_format(string): Optional. png, jpeg, webp, or gif. Use gif for requested animated GIFs; this plugin currently supports text-only GIF generation, without reference images.
+            frame_count(int): Optional. Integer GIF frame count, from 2 to 16; defaults to the configured value, initially 9.
+            frame_duration_ms(int): Optional. Integer GIF milliseconds per frame, from 20 to 2000, rounded to 10 ms; initially 200. Smaller values play faster.
 
         """
         if not prompt or not prompt.strip():
@@ -1492,22 +1612,23 @@ class GPTImage2Plugin(Star):
             )
 
         raw_event_prompt = self._event_text(event) or prompt
-        route_source_text = raw_event_prompt or prompt
-        auto_reference_images = False
+        try:
+            render_options = self._resolve_render_options(
+                output_format=output_format, frame_count=frame_count,
+                frame_duration_ms=frame_duration_ms, size=size,
+                aspect_ratio=aspect_ratio, resolution=resolution,
+                reference_image_paths=["requested-reference"] if use_reference_images else [],
+            )
+        except Exception as exc:
+            return f"图片参数不可用：{self._friendly_error(exc)}"
         reference_paths: list[str] = []
-        should_collect_reference_images = bool(use_reference_images)
-        if not should_collect_reference_images and _direct_reference_text_allows_image_edit(route_source_text):
-            should_collect_reference_images = True
-            auto_reference_images = True
-
-        if should_collect_reference_images:
-            reference_paths = await self._collect_reference_image_paths(event)
+        reference_source_records: list[dict[str, str]] = []
+        if use_reference_images:
+            reference_paths = await self._collect_reference_image_paths(
+                event, stabilize=True, source_records=reference_source_records,
+            )
             if not reference_paths:
-                if use_reference_images:
-                    return "没有找到参考图。请先发送或引用一张图片，再说明要怎么改。"
-                auto_reference_images = False
-            else:
-                use_reference_images = True
+                return "没有找到本条消息或明确引用消息中的参考图。请在本条消息附图，或回复/引用要修改的图片后再试；不会使用之前未引用的图片。"
 
         turn_key = self._tool_turn_key(event)
         turn_task = self._inflight_tool_turns.get(turn_key)
@@ -1523,23 +1644,9 @@ class GPTImage2Plugin(Star):
             self._inflight_tool_turn_traces.pop(turn_key, None)
 
         image_prompt = prompt
-        preprocess_stage: dict[str, Any] | None = None
-        if not reference_paths:
-            persona_requested = _text_generation_needs_persona(raw_event_prompt) or _text_generation_needs_persona(prompt)
-            persona_source_prompt = raw_event_prompt if persona_requested else prompt
-            image_prompt = await self._persona_aware_text_generation_prompt(
-                event,
-                persona_source_prompt,
-                force=persona_requested,
-            )
-            if image_prompt != persona_source_prompt:
-                preprocess_stage = {
-                    "name": "persona_rewrite",
-                    "status": "succeeded",
-                    "input_prompt": persona_source_prompt,
-                    "tool_prompt": prompt,
-                    "output_prompt": image_prompt,
-                }
+        dialog_prompt_passthrough = not reference_paths
+        if dialog_prompt_passthrough and style and style.strip() and style.strip().lower() != "auto":
+            image_prompt = f"{prompt}\n\nVisual style: {style.strip()}."
 
         request_key = self._tool_request_key(
             event,
@@ -1551,6 +1658,7 @@ class GPTImage2Plugin(Star):
             style=style,
             transparent_background=transparent_background,
             reference_paths=reference_paths,
+            render_options=render_options,
         )
         existing_task = self._inflight_tool_tasks.get(request_key)
         if existing_task and not existing_task.done():
@@ -1580,28 +1688,43 @@ class GPTImage2Plugin(Star):
                 "style": style,
                 "transparent_background": transparent_background,
                 "use_reference_images": use_reference_images,
-                "auto_reference_images": auto_reference_images,
+                "dialog_prompt_passthrough": dialog_prompt_passthrough,
+                "output_format": output_format,
+                "frame_count": frame_count,
+                "frame_duration_ms": frame_duration_ms,
+                "render_options": render_options,
             },
         )
         route = "image_edit" if reference_paths else "text_to_image"
         reason = "llm_tool_reference_images" if reference_paths else "llm_tool_text_generation"
-        if auto_reference_images and reference_paths:
-            reason = "auto_promoted_reference_edit"
-        elif not reference_paths and preprocess_stage and preprocess_stage.get("name") == "persona_rewrite":
-            route = "persona_generation"
-            reason = "llm_tool_persona_generation"
+        if dialog_prompt_passthrough:
+            reason = "llm_tool_dialog_prompt"
         self._trace_route_decision(
             trace,
             route=route,
             reason=reason,
             operation="edit" if reference_paths else "generation",
             reference_image_paths=reference_paths,
-            llm_requested_reference_images=bool(use_reference_images and not auto_reference_images),
-            auto_reference_images=auto_reference_images,
+            llm_requested_reference_images=bool(use_reference_images),
         )
-        if preprocess_stage:
-            name = str(preprocess_stage.pop("name", "preprocess_prompt"))
-            self._trace_stage(trace, name, **preprocess_stage)
+        self._trace_stage(
+            trace, "reference_selection", status="succeeded",
+            requested=bool(use_reference_images),
+            policy="current_or_explicit_quote_only",
+            sources=reference_source_records,
+            selected_paths=reference_paths,
+        )
+        self._trace_stage(
+            trace,
+            "dialog_tool_prompt",
+            status="succeeded",
+            source="current_dialog_tool_call",
+            input_prompt=raw_event_prompt,
+            tool_prompt=prompt,
+            output_prompt=image_prompt,
+            style=style,
+            passthrough=dialog_prompt_passthrough,
+        )
         task = asyncio.create_task(
             self._generate_image(
                 prompt=image_prompt,
@@ -1614,6 +1737,13 @@ class GPTImage2Plugin(Star):
                 transparent_background=transparent_background,
                 reference_image_paths=reference_paths,
                 trace=trace,
+                skip_prompt_enhance=dialog_prompt_passthrough,
+                skip_prompt_translation=dialog_prompt_passthrough,
+                raw_prompt_passthrough=dialog_prompt_passthrough,
+                output_format=output_format,
+                frame_count=frame_count,
+                frame_duration_ms=frame_duration_ms,
+                render_options=render_options,
             )
         )
         self._inflight_tool_tasks[request_key] = task
@@ -1649,7 +1779,11 @@ class GPTImage2Plugin(Star):
             self._schedule_background_delivery(event, task, error_prefix=error_prefix, trace=trace)
             return submitted_message
         except Exception as exc:
-            logger.error("GPT Image tool failed", exc_info=True)
+            logger.error(
+                "GPT Image tool failed (%s): %s",
+                type(exc).__name__,
+                self._friendly_error(exc),
+            )
             error_prefix = "图片修改失败" if reference_paths else "图片生成失败"
             self._trace_fail(trace, exc)
             reply = await self._image_error_reply(event, exc, error_prefix)
@@ -1700,15 +1834,35 @@ class GPTImage2Plugin(Star):
         reference_image_paths: list[str] | None = None,
         trace: dict[str, Any] | None = None,
         skip_prompt_enhance: bool = False,
+        skip_prompt_translation: bool = False,
+        raw_prompt_passthrough: bool = False,
+        advanced: bool = False,
+        expected_image_selection: tuple[str, str, str] | None = None,
+        output_format: str | None = None,
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
+        render_options: dict[str, Any] | None = None,
     ) -> tuple[str, str | None]:
+        # Freeze the model and connection together before any await. A provider
+        # reload must never pair an old credential with a newly selected URL.
         self._trace_update(trace, status="running")
-        self._ensure_enabled()
-        api_key = self._api_key()
-        if not api_key:
-            raise RuntimeError(
-                "图像接口没有配置 API Key。请填写插件配置里的 api.api_key，"
-                "或设置环境变量 OPENAI_API_KEY / TWO_API_KEY。"
-            )
+        connection = self._resolve_image_api_connection(advanced=advanced)
+        model = connection["model"]
+        base_url = connection["base_url"]
+        render_options = dict(render_options) if render_options is not None else self._resolve_render_options(
+            output_format=output_format, frame_count=frame_count,
+            frame_duration_ms=frame_duration_ms, size=size,
+            reference_image_paths=reference_image_paths,
+            aspect_ratio=aspect_ratio, resolution=resolution,
+        )
+        if render_options["output_format"] == "gif" and not self._bool_cfg("gif", "enabled", False):
+            raise RuntimeError("GIF 功能未开启。请在插件配置的“GIF 动图”中启用，并确认使用支持原生 GIF 的官方 API 源及完整透传参数的中转。")
+        if render_options["output_format"] == "gif" and reference_image_paths:
+            raise RuntimeError("本插件的 GIF 动图目前仅支持纯文字生成，不支持参考图或改图；本次不会丢弃参考图或改成静态图片。")
+        if expected_image_selection is not None and (
+            connection["provider_id"], model, base_url
+        ) != expected_image_selection:
+            raise RuntimeError("生图模型在确认后已变更，本次未提交；请重新建立 Plan 并确认。")
 
         references = self._prepare_reference_image_paths(reference_image_paths or [])
         self._trace_stage(
@@ -1765,7 +1919,10 @@ class GPTImage2Plugin(Star):
                     )
                 else:
                     raise RuntimeError(f"提示词增强失败：{self._friendly_error(exc)}") from exc
-        final_prompt = self._build_prompt(prompt_for_image, style_for_prompt)
+        if raw_prompt_passthrough:
+            final_prompt = prompt_for_image
+        else:
+            final_prompt = self._build_prompt(prompt_for_image, style_for_prompt)
         self._trace_stage(
             trace,
             "prompt_build",
@@ -1773,8 +1930,9 @@ class GPTImage2Plugin(Star):
             input_prompt=prompt_for_image,
             style=style_for_prompt,
             output_prompt=final_prompt,
+            passthrough=raw_prompt_passthrough,
         )
-        if self._bool_cfg("prompt", "translate_to_english", False):
+        if not skip_prompt_translation and self._bool_cfg("prompt", "translate_to_english", False):
             prompt_before_translation = final_prompt
             self._trace_stage(
                 trace,
@@ -1818,16 +1976,16 @@ class GPTImage2Plugin(Star):
             resolution=resolution,
             quality=quality,
         )
-        base_url = self._base_url()
-        model = self._model_name()
         cache_key = (base_url, model, operation)
         self._trace_update(
             trace,
             operation=operation,
             final_prompt=final_prompt,
             api={
+                "provider_id": connection["provider_id"],
                 "base_url": base_url,
                 "model": model,
+                "generation_tier": "advanced" if advanced else "normal",
                 "operation": operation,
             },
         )
@@ -1842,24 +2000,27 @@ class GPTImage2Plugin(Star):
             size=size,
             aspect_ratio=aspect_ratio,
             reference_image_paths=references,
+            base_url=base_url,
         )
         if self._request_has_strong_profile_hint(
             operation=operation,
             size=size,
             aspect_ratio=aspect_ratio,
             reference_image_paths=references,
+            base_url=base_url,
         ):
             initial_profile = heuristic_profile
         else:
             initial_profile = cached_profile or heuristic_profile
         other_profile = "flexible" if initial_profile == "standard" else "standard"
-        attempts = [initial_profile, other_profile]
+        attempts = ["standard"] if render_options["output_format"] == "gif" else [initial_profile, other_profile]
 
         async with self._semaphore:
             cached_profile = self._compat_profile_cache.get(cache_key)
             for idx, profile in enumerate(attempts):
                 payload = self._build_payload(
                     final_prompt,
+                    model=model,
                     profile=profile,
                     size=size,
                     aspect_ratio=aspect_ratio,
@@ -1867,11 +2028,13 @@ class GPTImage2Plugin(Star):
                     quality=quality,
                     transparent_background=transparent_background,
                     reference_image_paths=references,
+                    render_options=render_options,
                 )
                 self._log_request_start(
                     operation=operation,
                     profile=profile,
                     payload=payload,
+                    base_url=base_url,
                 )
                 self._trace_stage(
                     trace,
@@ -1883,9 +2046,9 @@ class GPTImage2Plugin(Star):
                 )
                 try:
                     if references:
-                        response = await self._post_images_edit_api(api_key, payload, references)
+                        response = await self._post_images_edit_api(connection, payload, references)
                     else:
-                        response = await self._post_images_generation_api(api_key, payload)
+                        response = await self._post_images_generation_api(connection, payload)
                 except ImageAPIError as exc:
                     errors.append(exc)
                     self._trace_stage(
@@ -1896,7 +2059,7 @@ class GPTImage2Plugin(Star):
                         http_status=exc.status,
                         error=str(exc.message)[:600],
                         body=(exc.body or "")[:1200],
-                        will_try_other_profile=idx == 0 and exc.should_try_other_profile(),
+                        will_try_other_profile=idx + 1 < len(attempts) and exc.should_try_other_profile(),
                     )
                     logger.warning(
                         "GPT Image %s with profile=%s failed: HTTP %d %s",
@@ -1905,7 +2068,7 @@ class GPTImage2Plugin(Star):
                         exc.status,
                         str(exc.message)[:200],
                     )
-                    if idx == 0 and exc.should_try_other_profile():
+                    if idx + 1 < len(attempts) and exc.should_try_other_profile():
                         # Worth a single retry with the other parameter dialect.
                         continue
                     break
@@ -1933,11 +2096,14 @@ class GPTImage2Plugin(Star):
                     str(errors[0].message)[:300],
                 )
             last = errors[-1]
-            error_message = self._format_api_error(last.status, last.body or last.message)
+            if render_options["output_format"] == "gif" and "gif output is not enabled" in f"{last.body} {last.message}".lower():
+                error_message = f"图像接口 HTTP {last.status}：当前供应商尚未开放原生 GIF 输出，请选择支持 GIF 的供应商；本次不会改用静态图片。"
+            else:
+                error_message = self._format_api_error(last.status, last.body or last.message)
             self._trace_update(trace, status="failed", error=error_message)
             raise RuntimeError(error_message) from last
 
-        if succeeded_profile in {"standard", "flexible"}:
+        if render_options["output_format"] != "gif" and succeeded_profile in {"standard", "flexible"}:
             self._compat_profile_cache[cache_key] = succeeded_profile
             if cached_profile and cached_profile != succeeded_profile:
                 logger.info(
@@ -1950,7 +2116,9 @@ class GPTImage2Plugin(Star):
                 )
 
         response_metadata = self._trace_response_metadata(response)
-        image_path, revised_prompt = await self._save_image_from_response(response)
+        image_path, revised_prompt = await self._save_image_from_response(
+            response, expected_format=render_options["output_format"], expected_render=render_options,
+        )
         self._cleanup_old_images()
         self._trace_update(
             trace,
@@ -1966,18 +2134,20 @@ class GPTImage2Plugin(Star):
 
     async def _post_images_generation_api(
         self,
-        api_key: str,
+        connection: dict[str, Any],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        url = self._images_generation_url()
-        headers = self._api_headers(api_key, content_type="application/json")
+        url = self._images_generation_url(connection["base_url"])
+        headers = {**connection["headers"], "Content-Type": "application/json"}
         timeout = aiohttp.ClientTimeout(total=max(10, self._timeout_seconds()))
         retry_times = self._mutation_retry_times()
 
         for attempt in range(retry_times + 1):
             try:
                 async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                    async with session.post(url, headers=headers, json=payload) as resp:
+                    async with session.post(url, headers=headers, json=payload, allow_redirects=False) as resp:
+                        if 300 <= resp.status < 400:
+                            raise RuntimeError("生图供应商返回了重定向，已停止发送凭据。请在 AstrBot 供应商设置中填写最终 API 地址。")
                         if resp.status in TRANSIENT_HTTP_STATUSES and attempt < retry_times:
                             text = await self._read_limited_response_text(resp)
                             await self._sleep_before_network_retry(
@@ -2012,14 +2182,15 @@ class GPTImage2Plugin(Star):
 
     async def _post_images_edit_api(
         self,
-        api_key: str,
+        connection: dict[str, Any],
         payload: dict[str, Any],
         image_paths: list[str],
     ) -> dict[str, Any]:
-        url = self._images_edit_url()
-        headers = self._api_headers(api_key)
+        url = self._images_edit_url(connection["base_url"])
+        headers = dict(connection["headers"])
         timeout = aiohttp.ClientTimeout(total=max(10, self._timeout_seconds()))
         retry_times = self._mutation_retry_times()
+        image_paths = self._prepare_reference_image_paths(image_paths)
 
         for attempt in range(retry_times + 1):
             form = aiohttp.FormData()
@@ -2030,7 +2201,16 @@ class GPTImage2Plugin(Star):
             try:
                 for image_path in image_paths:
                     content_type = self._detect_image_content_type(image_path)
-                    file_obj = open(image_path, "rb")
+                    try:
+                        file_obj = open(image_path, "rb")
+                    except OSError as exc:
+                        logger.warning(
+                            "GPT Image skipped reference unavailable before upload "
+                            "name=%s error=%s",
+                            Path(image_path).name,
+                            type(exc).__name__,
+                        )
+                        continue
                     opened_files.append(file_obj)
                     form.add_field(
                         "image",
@@ -2039,9 +2219,14 @@ class GPTImage2Plugin(Star):
                         content_type=content_type,
                     )
 
+                if not opened_files:
+                    raise RuntimeError("参考图在上传前已失效，请重新发送或引用图片后再试。")
+
                 try:
                     async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                        async with session.post(url, headers=headers, data=form) as resp:
+                        async with session.post(url, headers=headers, data=form, allow_redirects=False) as resp:
+                            if 300 <= resp.status < 400:
+                                raise RuntimeError("生图供应商返回了重定向，已停止发送凭据。请在 AstrBot 供应商设置中填写最终 API 地址。")
                             if resp.status in TRANSIENT_HTTP_STATUSES and attempt < retry_times:
                                 text = await self._read_limited_response_text(resp)
                                 await self._sleep_before_network_retry(
@@ -2080,7 +2265,10 @@ class GPTImage2Plugin(Star):
 
         raise RuntimeError("图像编辑接口请求失败：网络重试后仍未返回结果。")
 
-    async def _save_image_from_response(self, response: dict[str, Any]) -> tuple[str, str | None]:
+    async def _save_image_from_response(
+        self, response: dict[str, Any], *, expected_format: str | None = None,
+        expected_render: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None]:
         normalized_response = self._extract_image_response(response)
         if normalized_response:
             response = normalized_response
@@ -2094,7 +2282,7 @@ class GPTImage2Plugin(Star):
             raise RuntimeError("图像接口返回格式异常：data[0] 不是对象。")
 
         revised_prompt = item.get("revised_prompt")
-        output_format = self._output_format()
+        output_format = (expected_render or {}).get("output_format") or expected_format or self._output_format()
         suffix = ".jpg" if output_format == "jpeg" else f".{output_format}"
         file_path = self._image_dir / f"gpt_image_2_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{suffix}"
 
@@ -2107,6 +2295,8 @@ class GPTImage2Plugin(Star):
                 raise RuntimeError("图像接口返回的 b64_json 无法解码。") from exc
             if not image_bytes:
                 raise RuntimeError("图像接口返回了空的 b64_json。")
+            if output_format == "gif":
+                self._validate_generated_gif(image_bytes, render_options=expected_render)
             actual_suffix = self._image_suffix_from_bytes(image_bytes)
             if actual_suffix:
                 file_path = file_path.with_suffix(actual_suffix)
@@ -2115,12 +2305,17 @@ class GPTImage2Plugin(Star):
 
         image_url = item.get("url")
         if isinstance(image_url, str) and image_url.startswith(("http://", "https://")):
-            file_path = await self._download_image(image_url, file_path)
+            file_path = await self._download_image(
+                image_url, file_path, expected_format=output_format, expected_render=expected_render,
+            )
             return str(file_path), revised_prompt
 
         raise RuntimeError("图像接口没有返回 b64_json 或 url。")
 
-    async def _download_image(self, url: str, file_path: Path) -> Path:
+    async def _download_image(
+        self, url: str, file_path: Path, *, expected_format: str | None = None,
+        expected_render: dict[str, Any] | None = None,
+    ) -> Path:
         timeout = aiohttp.ClientTimeout(total=max(10, self._timeout_seconds()))
         retry_times = self._network_retry_times()
         headers = {"User-Agent": self._user_agent()}
@@ -2147,6 +2342,8 @@ class GPTImage2Plugin(Star):
                         data = await resp.read()
                         if not data:
                             raise RuntimeError("下载图片失败：响应内容为空。")
+                        if expected_format == "gif":
+                            self._validate_generated_gif(data, render_options=expected_render)
                         actual_suffix = self._image_suffix_from_bytes(data, resp.headers.get("Content-Type", ""))
                         if actual_suffix:
                             file_path = file_path.with_suffix(actual_suffix)
@@ -2198,12 +2395,14 @@ class GPTImage2Plugin(Star):
         configured = self._int_cfg(
             "runtime",
             "image_request_retry_times",
-            self._int_cfg("runtime", "retry_times", 1),
+            0,
         )
         return min(5, max(0, configured))
 
-    def _log_request_start(self, *, operation: str, profile: str, payload: dict[str, Any]) -> None:
-        url = self._images_edit_url() if operation == "edit" else self._images_generation_url()
+    def _log_request_start(
+        self, *, operation: str, profile: str, payload: dict[str, Any], base_url: str | None = None,
+    ) -> None:
+        url = self._images_edit_url(base_url) if operation == "edit" else self._images_generation_url(base_url)
         logger.info(
             "GPT Image request start operation=%s profile=%s model=%s url=%s timeout=%s retry=%s size=%s resolution=%s",
             operation,
@@ -2335,15 +2534,23 @@ class GPTImage2Plugin(Star):
                 self._trace_stage(trace, "qq_delivery", status="succeeded")
             except Exception as exc:
                 self._trace_fail(trace, exc)
-                logger.error("GPT Image background delivery failed", exc_info=True)
+                logger.error(
+                    "GPT Image background delivery failed (%s): %s",
+                    type(exc).__name__,
+                    self._friendly_error(exc),
+                )
                 try:
                     reply = await self._image_error_reply(event, exc, error_prefix)
                     flow_id = self._trace_flow_id(trace)
                     if flow_id:
                         reply = f"流程ID：{flow_id}\n{reply}"
                     await event.send(event.plain_result(reply))
-                except Exception:
-                    logger.error("Failed to send GPT Image background error", exc_info=True)
+                except Exception as send_exc:
+                    logger.error(
+                        "Failed to send GPT Image background error (%s): %s",
+                        type(send_exc).__name__,
+                        self._friendly_error(send_exc),
+                    )
 
         sender = asyncio.create_task(_deliver())
         self._background_tasks.add(sender)
@@ -2355,8 +2562,9 @@ class GPTImage2Plugin(Star):
             exc = done_task.exception()
             if exc:
                 logger.error(
-                    "GPT Image background sender crashed",
-                    exc_info=(type(exc), exc, exc.__traceback__),
+                    "GPT Image background sender crashed (%s): %s",
+                    type(exc).__name__,
+                    self._friendly_error(exc),
                 )
 
         sender.add_done_callback(_report_done)
@@ -2372,8 +2580,16 @@ class GPTImage2Plugin(Star):
         quality: str | None,
         transparent_background: bool,
         reference_image_paths: list[str],
+        model: str | None = None,
+        render_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        model = self._model_name()
+        model = model or self._model_name()
+        render_options = render_options or self._resolve_render_options(size=size)
+        output_format = render_options["output_format"]
+        # Recheck after queueing / prompt awaits: disabling GIF must also stop
+        # previously prepared jobs before their first paid request.
+        if output_format == "gif" and not self._bool_cfg("gif", "enabled", False):
+            raise RuntimeError("GIF 功能未开启。请在插件配置的“GIF 动图”中启用，并确认使用支持原生 GIF 的官方 API 源及完整透传参数的中转。")
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -2384,7 +2600,9 @@ class GPTImage2Plugin(Star):
         # ratios mapped to one of three OpenAI-accepted dimensions). ``flexible``
         # lets the size field carry an aspect ratio string the way most webpage
         # reverse / 2api suppliers expect.
-        if profile == "flexible":
+        if output_format == "gif":
+            normalized_size = render_options["size"]
+        elif profile == "flexible":
             normalized_size = self._normalize_compatible_size(
                 size,
                 aspect_ratio=aspect_ratio,
@@ -2408,7 +2626,7 @@ class GPTImage2Plugin(Star):
             prefer_reference_ratio=bool(reference_image_paths),
         )
         normalized_resolution = self._normalize_resolution(resolution)
-        if normalized_resolution != "auto":
+        if output_format != "gif" and normalized_resolution != "auto":
             payload["resolution"] = normalized_resolution
 
         normalized_quality = self._normalize_quality(quality)
@@ -2416,10 +2634,12 @@ class GPTImage2Plugin(Star):
             payload["quality"] = normalized_quality
 
         configured_background = self._str_cfg("image", "background", "auto")
-        output_format = self._output_format()
         if output_format == "jpeg" and (transparent_background or configured_background == "transparent"):
             output_format = "png"
         payload["output_format"] = output_format
+        if output_format == "gif":
+            payload["frame_count"] = render_options["frame_count"]
+            payload["frame_duration_ms"] = render_options["frame_duration_ms"]
 
         compression = self._int_cfg("image", "output_compression", 0)
         if output_format in {"jpeg", "webp"} and 0 < compression <= 100:
@@ -2444,127 +2664,6 @@ class GPTImage2Plugin(Star):
             return False
         return True
 
-    async def _persona_aware_text_generation_prompt(
-        self,
-        event: AstrMessageEvent,
-        prompt: str,
-        *,
-        force: bool = False,
-    ) -> str:
-        if not force and not _text_generation_needs_persona(prompt):
-            return prompt
-
-        persona_name, persona_prompt, persona_source = await self._resolve_image_persona_mask(event)
-        fallback_prompt = self._fallback_persona_image_prompt(prompt, persona_name, persona_prompt)
-        provider = self._self_persona_provider(event)
-        if not provider:
-            logger.warning("GPT Image persona prompt rewrite skipped: no dialog provider available")
-            return fallback_prompt
-
-        rewrite_prompt = self._render_self_persona_template(
-            self._str_cfg("self_persona", "prompt_template", "")
-            or DEFAULT_SELF_PERSONA_REWRITE_TEMPLATE,
-            persona_name=persona_name,
-            persona_prompt=persona_prompt,
-            user_prompt=prompt,
-        )
-        try:
-            timeout = max(
-                5,
-                self._int_cfg(
-                    "self_persona",
-                    "timeout_seconds",
-                    self._int_cfg("prompt_enhance", "timeout_seconds", 45),
-                ),
-            )
-            response = await asyncio.wait_for(
-                provider.text_chat(
-                    prompt=rewrite_prompt,
-                    session_id=f"gpt-image-persona-prompt-{uuid.uuid4().hex}",
-                    persist=False,
-                ),
-                timeout=timeout,
-            )
-            rewritten = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
-            if rewritten:
-                max_chars = max(200, self._int_cfg("prompt_enhance", "max_output_chars", 4000))
-                max_chars = max(
-                    200,
-                    self._int_cfg("self_persona", "max_output_chars", max_chars),
-                )
-                logger.info(
-                    "GPT Image persona prompt rewrite done provider=%s persona=%s source=%s raw_len=%d rewritten_len=%d",
-                    self._provider_label(provider),
-                    persona_name,
-                    persona_source,
-                    len(prompt),
-                    len(rewritten),
-                )
-                return rewritten[:max_chars].rstrip()
-        except Exception as exc:
-            logger.warning("GPT Image persona prompt rewrite failed, using fallback prompt: %s", exc)
-        return fallback_prompt
-
-    def _fallback_persona_image_prompt(self, prompt: str, persona_name: str, persona_prompt: str) -> str:
-        return f"""
-根据当前 bot 生图人设生成图像。
-
-生图人设名称：{persona_name}
-
-生图人设/视觉设定：
-{persona_prompt}
-
-用户生图请求：
-{prompt}
-
-请将“你/你的/自己/自拍/本体/形象”等指代理解为上述 bot 生图人设的可视化形象。生成一张符合人设、用户请求和画面语境的图像，不要添加无关文字、logo、水印或额外角色。
-""".strip()
-
-    async def _resolve_image_persona_mask(self, event: AstrMessageEvent) -> tuple[str, str, str]:
-        if self._bool_cfg("self_persona", "enable", True):
-            configured_name = self._str_cfg("self_persona", "persona_name", "")
-            configured_prompt = self._str_cfg("self_persona", "persona_prompt", "")
-            if configured_name or configured_prompt:
-                return (
-                    configured_name or "插件内生图人设",
-                    configured_prompt or "根据人设名称做合理视觉化。",
-                    "plugin",
-                )
-            if not self._bool_cfg("self_persona", "fallback_to_astrbot_persona", True):
-                return "插件内生图人设", "根据用户请求做合理视觉化。", "plugin-empty"
-
-        persona_name, persona_prompt = await self._resolve_persona_mask(event)
-        return persona_name, persona_prompt, "astrbot"
-
-    def _self_persona_provider(self, event: AstrMessageEvent) -> Provider | None:
-        provider_id = self._str_cfg("self_persona", "provider_id", "")
-        if provider_id:
-            try:
-                provider = self.context.get_provider_by_id(provider_id)
-            except Exception as exc:
-                logger.warning("GPT Image self persona provider lookup failed: %s", exc)
-                provider = None
-            if isinstance(provider, Provider):
-                return provider
-            logger.warning(
-                "GPT Image self persona provider %r unavailable; fallback to dialog provider",
-                provider_id,
-            )
-        return self._event_dialog_provider(event)
-
-    def _render_self_persona_template(self, template: str, **values: str) -> str:
-        rendered = template
-        for key, value in values.items():
-            rendered = rendered.replace("{" + key + "}", value or "")
-        if "{user_prompt}" not in template:
-            rendered = f"{rendered.strip()}\n\n用户原始生图请求：\n{values.get('user_prompt', '')}"
-        if "{persona_prompt}" not in template:
-            rendered = (
-                f"{rendered.strip()}\n\n插件内人设/视觉设定：\n"
-                f"{values.get('persona_prompt', '')}"
-            )
-        return rendered.strip()
-
     def _event_dialog_provider(self, event: AstrMessageEvent) -> Provider | None:
         provider = None
         try:
@@ -2577,75 +2676,6 @@ class GPTImage2Plugin(Star):
             except Exception:
                 provider = None
         return provider if isinstance(provider, Provider) else None
-
-    async def _resolve_persona_mask(self, event: AstrMessageEvent) -> tuple[str, str]:
-        persona_id = ""
-        try:
-            session_service_config = await sp.get_async(
-                scope="umo",
-                scope_id=event.unified_msg_origin,
-                key="session_service_config",
-                default={},
-            )
-            if isinstance(session_service_config, dict):
-                persona_id = str(session_service_config.get("persona_id") or "").strip()
-        except Exception as exc:
-            logger.debug("GPT Image failed to read session persona: %s", exc)
-
-        if not persona_id:
-            try:
-                curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
-                    event.unified_msg_origin,
-                )
-                if curr_cid:
-                    conv = await self.context.conversation_manager.get_conversation(
-                        event.unified_msg_origin,
-                        curr_cid,
-                    )
-                    if conv and conv.persona_id:
-                        persona_id = str(conv.persona_id).strip()
-            except Exception as exc:
-                logger.debug("GPT Image failed to read conversation persona: %s", exc)
-
-        if not persona_id:
-            try:
-                cfg = self.context.get_config(umo=event.unified_msg_origin)
-                persona_id = str(
-                    cfg.get("provider_settings", {}).get("default_personality") or ""
-                ).strip()
-            except Exception as exc:
-                logger.debug("GPT Image failed to read default persona config: %s", exc)
-
-        if persona_id == "[%None]":
-            return "none", "No persona mask."
-
-        persona = None
-        if persona_id:
-            try:
-                persona = next(
-                    (
-                        p
-                        for p in self.context.persona_manager.personas_v3
-                        if p.get("name") == persona_id
-                    ),
-                    None,
-                )
-            except Exception:
-                persona = None
-
-        if not persona:
-            try:
-                persona = await self.context.persona_manager.get_default_persona_v3(
-                    event.unified_msg_origin,
-                )
-            except Exception:
-                persona = {"name": "default", "prompt": ""}
-
-        persona_name = str(persona.get("name") or "default")
-        persona_prompt = str(persona.get("prompt") or "").strip()
-        if not persona_prompt:
-            persona_prompt = "You are a helpful and friendly assistant."
-        return persona_name, persona_prompt
 
     def _collect_reference_description_texts(self, event: AstrMessageEvent) -> list[str]:
         texts: list[str] = []
@@ -3008,20 +3038,6 @@ class GPTImage2Plugin(Star):
             return prompt.replace(placeholder, placeholder_fill).strip()
         return prompt.strip()
 
-    def _build_placeholder_prompt(self, subject_prompt: str) -> str:
-        placeholder = self._prompt_enhance_placeholder()
-        template = (
-            self._str_cfg("prompt_enhance", "final_prompt_template", "")
-            or DEFAULT_PROMPT_PLACEHOLDER_TEMPLATE
-        )
-        if placeholder in template:
-            return template.replace(placeholder, subject_prompt.strip()).strip()
-        logger.warning(
-            "GPT Image placeholder prompt template does not contain placeholder %r; appending extracted subject",
-            placeholder,
-        )
-        return f"{template.strip()}\n\nSubject to generate:\n{subject_prompt.strip()}".strip()
-
     def _clean_enhanced_prompt(self, text: str) -> str:
         cleaned = (text or "").strip()
         if cleaned.startswith("```"):
@@ -3209,11 +3225,11 @@ class GPTImage2Plugin(Star):
 
     def _plan_expired_text(self) -> str:
         minutes = max(1, self._plan_session_ttl_seconds() // 60)
-        return f"当前 Image2 Studio Plan 已超过 {minutes} 分钟未更新，已自动退出。请重新用 /plan 开始。"
+        return f"当前 GPT Image · 龙绘 Plan 已超过 {minutes} 分钟未更新，已自动退出。请重新用 /plan 开始。"
 
     def _plan_help_text(self) -> str:
         return (
-            "Image2 Studio Plan 模式：\n"
+            "GPT Image · 龙绘 Plan 模式：\n"
             "/plan 画图需求 - 创建或补充高级画图计划\n"
             "/plan status - 查看当前计划\n"
             "/plan confirm - 确认并开始生成\n"
@@ -3231,6 +3247,9 @@ class GPTImage2Plugin(Star):
 
     def _merge_plan_options(self, session: dict[str, Any], opts: dict[str, Any]) -> None:
         target = session.setdefault("options", {})
+        if opts.get("output_format") and str(opts["output_format"]).lower() != "gif":
+            target.pop("frame_count", None)
+            target.pop("frame_duration_ms", None)
         for key, value in (opts or {}).items():
             if value is None:
                 continue
@@ -3239,6 +3258,27 @@ class GPTImage2Plugin(Star):
             if isinstance(value, bool) and value is False:
                 continue
             target[key] = value
+
+    def _freeze_plan_render_options(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Keep the plan's displayed rendering defaults until explicitly edited.
+
+        Args:
+            session: The active plan whose options are frozen in place.
+
+        Returns:
+            An independent rendering snapshot without provider credentials.
+        """
+        options = session.setdefault("options", {})
+        render = self._resolve_render_options(
+            output_format=options.get("output_format"),
+            frame_count=options.get("frame_count"),
+            frame_duration_ms=options.get("frame_duration_ms"),
+            size=options.get("size"),
+            reference_image_paths=session.get("reference_image_paths"),
+            aspect_ratio=options.get("aspect_ratio"), resolution=options.get("resolution"),
+        )
+        options.update(render)
+        return render
 
     def _merge_plan_references(self, session: dict[str, Any], reference_paths: list[str]) -> None:
         if not reference_paths:
@@ -3255,6 +3295,7 @@ class GPTImage2Plugin(Star):
                 break
 
     async def _refresh_plan_session(self, session: dict[str, Any], *, latest_prompt: str) -> None:
+        revision = session.get("revision")
         if not self._bool_cfg("plan", "enable_model_planning", True):
             session["planned_prompt"] = self._plan_raw_prompt(session)
             session["planned_response"] = self._fallback_plan_response(session)
@@ -3281,7 +3322,7 @@ class GPTImage2Plugin(Star):
         )
         timeout = max(5, self._int_cfg("plan", "timeout_seconds", 60))
         logger.info(
-            "Image2 Studio plan model start provider=%s refs=%d prompt_len=%d timeout=%s",
+            "GPT Image · 龙绘 plan model start provider=%s refs=%d prompt_len=%d timeout=%s",
             self._provider_label(provider),
             len(image_urls),
             len(raw_prompt),
@@ -3297,6 +3338,8 @@ class GPTImage2Plugin(Star):
             timeout=timeout,
         )
         planned_response = self._clean_enhanced_prompt(getattr(response, "completion_text", "") or "")
+        if session.get("revision") != revision:
+            raise RuntimeError("计划已修改，丢弃旧整理结果")
         if not planned_response:
             raise RuntimeError("Plan 模型没有返回有效内容")
         max_chars = max(500, self._int_cfg("plan", "max_output_chars", 5000))
@@ -3307,7 +3350,7 @@ class GPTImage2Plugin(Star):
         session["planned_at"] = time.time()
         session.pop("planning_error", None)
         logger.info(
-            "Image2 Studio plan model done provider=%s output_len=%d final_prompt_len=%d",
+            "GPT Image · 龙绘 plan model done provider=%s output_len=%d final_prompt_len=%d",
             self._provider_label(provider),
             len(planned_response),
             len(planned_prompt),
@@ -3380,6 +3423,65 @@ class GPTImage2Plugin(Star):
             return planned_prompt
         return self._extract_plan_final_prompt(str(session.get("planned_response") or ""))
 
+    def _plan_submission_fingerprint(self, session: dict[str, Any]) -> str:
+        connection = self._resolve_image_api_connection(advanced=True)
+        inputs = {
+            "render_options": self._freeze_plan_render_options(session),
+            "image_selection": (connection["provider_id"], connection["model"], connection["base_url"]),
+            "raw_prompt": self._plan_raw_prompt(session),
+            "planned_prompt": self._plan_final_prompt(session),
+            "options": session.get("options") or {},
+            "reference_image_paths": session.get("reference_image_paths") or [],
+            "revision": session.get("revision", 0),
+            "prompt_settings": {
+                key: self.config.get("prompt", {}).get(key)
+                for key in (
+                    "prompt_prefix", "prompt_suffix", "negative_prompt", "translate_to_english",
+                    "translation_provider_id", "translation_template", "translation_max_output_chars",
+                )
+            },
+            "preview_max_chars": self._int_cfg("plan", "preview_translation_max_output_chars", 4000),
+        }
+        return hashlib.sha256(json.dumps(inputs, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _validated_plan_reference_paths(self, session: dict[str, Any]) -> list[str]:
+        paths = [os.path.abspath(str(path)) for path in session.get("reference_image_paths", []) if path]
+        if len(paths) > self._max_reference_images() or any(not os.path.isfile(path) for path in paths):
+            raise RuntimeError("已选参考图已失效或超出数量限制，请重新附图或引用后重新建立计划；本次不会减少参考图或改为文生图")
+        prepared = self._prepare_reference_image_paths(paths)
+        if prepared != paths:
+            raise RuntimeError("部分已选参考图不可用，请重新附图或引用后重新建立计划；本次不会减少参考图")
+        return paths
+
+    async def _prepare_plan_submission(self, session: dict[str, Any]) -> dict[str, Any]:
+        lock = session.setdefault("submission_lock", asyncio.Lock())
+        async with lock:
+            if session.get("planning"):
+                raise RuntimeError("当前计划正在整理，请稍候再试")
+            render_options = self._freeze_plan_render_options(session)
+            fingerprint = self._plan_submission_fingerprint(session)
+            prepared = session.get("prepared_submission")
+            if isinstance(prepared, dict) and prepared.get("fingerprint") == fingerprint:
+                return prepared
+            session.pop("prepared_submission", None)
+            prompt = self._plan_final_prompt(session) or self._plan_raw_prompt(session)
+            cn_prompt = self._build_prompt(prompt, (session.get("options") or {}).get("style"))
+            final_prompt = await self._plan_mixed_prompt_preview(cn_prompt)
+            if not final_prompt or not final_prompt.strip():
+                raise RuntimeError("最终提示词为空，请检查计划或翻译模型后重试")
+            if self._plan_submission_fingerprint(session) != fingerprint:
+                raise RuntimeError("准备期间计划或生图模型已修改，请查看最新计划后重试")
+            connection = self._resolve_image_api_connection(advanced=True)
+            prepared = {
+                "fingerprint": fingerprint,
+                "chinese_prompt": cn_prompt,
+                "final_prompt": final_prompt,
+                "image_selection": (connection["provider_id"], connection["model"], connection["base_url"]),
+                "render_options": render_options,
+            }
+            session["prepared_submission"] = prepared
+            return prepared
+
     def _fallback_plan_response(self, session: dict[str, Any], *, error: str = "") -> str:
         raw_prompt = self._plan_raw_prompt(session)
         refs = session.get("reference_image_paths") or []
@@ -3412,12 +3514,17 @@ class GPTImage2Plugin(Star):
         refs = session.get("reference_image_paths") or []
         opts = session.get("options") or {}
         planned_response = str(session.get("planned_response") or "").strip()
+        selection = (session.get("prepared_submission") or {}).get("image_selection") or ()
+        model_text = f"{selection[0]}（{selection[1]}）" if len(selection) >= 2 else "尚未准备"
         if planned_response:
             lines = [
-                "Image2 Studio Plan 已整理。",
+                "GPT Image · 龙绘 Plan 已整理。",
                 f"所属：{self._plan_owner_text(session)}",
+                f"生图模型：{model_text}",
                 "",
-                planned_response,
+                "计划整理稿（不代表最终提交文本）：\n" + planned_response,
+                "",
+                "最终提交提示词：\n" + str((session.get("prepared_submission") or {}).get("final_prompt") or "尚未准备"),
                 "",
                 f"参考图：{len(refs)} 张",
             ]
@@ -3436,7 +3543,7 @@ class GPTImage2Plugin(Star):
             )
             return "\n".join(lines).strip()
         lines = [
-            "Image2 Studio Plan 已记录。",
+            "GPT Image · 龙绘 Plan 已记录。",
             f"所属：{self._plan_owner_text(session)}",
             "",
             "当前需求：",
@@ -3465,9 +3572,12 @@ class GPTImage2Plugin(Star):
         refs = session.get("reference_image_paths") or []
         opts = session.get("options") or {}
         params = self._format_plan_options(opts) or "默认"
+        selection = (session.get("prepared_submission") or {}).get("image_selection") or ()
+        model_text = f"{selection[0]}（{selection[1]}）" if len(selection) >= 2 else "尚未准备"
         status_text = (
-            "Image2 Studio Plan 已整理。"
+            "GPT Image · 龙绘 Plan 已整理。"
             f"\n所属：{self._plan_owner_text(session, event)}"
+            f"\n生图模型：{model_text}"
             f"\n参考图：{len(refs)} 张"
             f"\n参数：{params}"
         )
@@ -3475,7 +3585,12 @@ class GPTImage2Plugin(Star):
             status_text += f"\n提示：Plan 模型上次调用失败，当前展示为兜底整理。\n错误：{session.get('planning_error')}"
 
         node_items: list[tuple[str, str]] = [("Plan 状态", status_text)]
-        node_items.extend(self._split_plan_response_sections(planned_response))
+        node_items.extend(
+            ("计划提示词草稿" if "最终提示词" in title else title, body)
+            for title, body in self._split_plan_response_sections(planned_response)
+        )
+        prepared = session.get("prepared_submission") or {}
+        node_items.append(("最终提交提示词", str(prepared.get("final_prompt") or "尚未准备")))
         node_items.append(
             (
                 "操作",
@@ -3500,7 +3615,7 @@ class GPTImage2Plugin(Star):
                     )
             return [nodes]
         except Exception:
-            logger.debug("Image2 Studio failed to build merged plan status nodes", exc_info=True)
+            logger.debug("GPT Image · 龙绘 failed to build merged plan status nodes", exc_info=True)
             return [Plain(self._format_plan_session_status(session))]
 
     def _split_plan_response_sections(self, planned_response: str) -> list[tuple[str, str]]:
@@ -3547,6 +3662,9 @@ class GPTImage2Plugin(Star):
 
     def _format_plan_options(self, opts: dict[str, Any]) -> str:
         labels = {
+            "output_format": "格式",
+            "frame_count": "帧数",
+            "frame_duration_ms": "每帧时长",
             "size": "尺寸",
             "aspect_ratio": "比例",
             "resolution": "清晰度",
@@ -3555,29 +3673,31 @@ class GPTImage2Plugin(Star):
             "transparent_background": "透明背景",
         }
         parts: list[str] = []
-        for key in ("size", "aspect_ratio", "resolution", "quality", "style", "transparent_background"):
+        for key in ("output_format", "frame_count", "frame_duration_ms", "size", "aspect_ratio", "resolution", "quality", "style", "transparent_background"):
             value = opts.get(key)
             if value is None or value == "" or value is False:
                 continue
+            if key == "output_format":
+                value = str(value).upper()
+            elif key == "frame_count":
+                value = f"{value} 帧"
+            elif key == "frame_duration_ms":
+                value = f"{value} 毫秒"
             parts.append(f"{labels.get(key, key)}={value}")
         return "，".join(parts)
 
     async def _plan_mixed_prompt_preview(self, cn_prompt: str) -> str:
         if not self._bool_cfg("prompt", "translate_to_english", False):
             return cn_prompt
-        try:
-            preview_max_chars = max(
-                2000,
-                self._int_cfg("prompt", "translation_max_output_chars", 4000),
-                self._int_cfg("plan", "preview_translation_max_output_chars", 4000),
-            )
-            return await self._translate_prompt_to_english(
-                cn_prompt,
-                max_output_chars=preview_max_chars,
-            )
-        except Exception as exc:
-            logger.warning("Image2 Studio plan prompt preview translation failed: %s", self._friendly_error(exc))
-            return f"{cn_prompt}\n\n（英文/混合提示词预览失败，将按常规生成流程处理：{self._friendly_error(exc)}）"
+        preview_max_chars = max(
+            2000,
+            self._int_cfg("prompt", "translation_max_output_chars", 4000),
+            self._int_cfg("plan", "preview_translation_max_output_chars", 4000),
+        )
+        return await self._translate_prompt_to_english(
+            cn_prompt,
+            max_output_chars=preview_max_chars,
+        )
 
     def _build_plan_confirm_chain(
         self,
@@ -3597,8 +3717,8 @@ class GPTImage2Plugin(Star):
         node_items = [
             ("流程ID", f"流程ID：{flow_id}\n任务类型：{operation}\n所属：{owner_text or '未知用户'}"),
             ("中文需求摘要", raw_prompt),
-            ("中文最终提示词", cn_prompt),
-            ("英文/混合最终提示词", mixed_prompt),
+            ("翻译前提示词", cn_prompt),
+            ("最终提交提示词", mixed_prompt),
             ("参数", f"参数：{params}\n参考图：{reference_count} 张"),
         ]
         try:
@@ -3618,7 +3738,7 @@ class GPTImage2Plugin(Star):
                     )
             return [nodes]
         except Exception:
-            logger.debug("Image2 Studio failed to build merged plan nodes", exc_info=True)
+            logger.debug("GPT Image · 龙绘 failed to build merged plan nodes", exc_info=True)
             lines = ["高级画图计划已确认"]
             for title, text in node_items:
                 lines.extend(["", f"【{title}】", text])
@@ -3729,6 +3849,51 @@ class GPTImage2Plugin(Star):
     def _trace_time_text(self, timestamp: float) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
 
+    def _trace_access_identity(self, event: AstrMessageEvent) -> dict[str, str] | None:
+        """Use AstrBot's platform-isolated session and authenticated sender identity."""
+        try:
+            identity = {
+                "platform_id": str(event.get_platform_id() or "").strip(),
+                "unified_msg_origin": str(event.unified_msg_origin or "").strip(),
+                "sender_id": str(event.get_sender_id() or "").strip(),
+            }
+        except Exception:
+            return None
+        return identity if all(identity.values()) else None
+
+    def _can_access_image_trace(self, event: AstrMessageEvent, trace: dict[str, Any]) -> bool:
+        try:
+            # AstrMessageEvent.is_admin() checks the role set by WakingCheckStage;
+            # is_private_chat() checks the framework's FRIEND_MESSAGE type.
+            # Never disclose another conversation's content into a group.
+            if event.is_admin() is True and event.is_private_chat() is True:
+                return True
+        except Exception:
+            pass
+        stored = trace.get("event")
+        current = self._trace_access_identity(event)
+        if not isinstance(stored, dict) or current is None:
+            return False
+        if not isinstance(stored.get("sender_id"), (str, int)):
+            return False
+        if str(stored["sender_id"]) != current["sender_id"]:
+            return False
+        if "platform_id" in stored or "unified_msg_origin" in stored:
+            return all(
+                isinstance(stored.get(key), str) and stored[key] == current[key]
+                for key in ("platform_id", "unified_msg_origin")
+            )
+        # Older traces stored the full UMO as the first composite-scope token.
+        # Later tokens include bare session IDs that can themselves resemble a
+        # different platform's UMO, so they must never authorize a query.
+        scope = stored.get("scope")
+        origin = current["unified_msg_origin"]
+        return (
+            isinstance(scope, str)
+            and origin.startswith(current["platform_id"] + ":")
+            and scope.split("|", 1)[0] == origin
+        )
+
     def _trace_event_info(self, event: AstrMessageEvent) -> dict[str, Any]:
         info: dict[str, Any] = {
             "scope": self._event_scope_key(event),
@@ -3751,6 +3916,9 @@ class GPTImage2Plugin(Star):
                 continue
             if value:
                 info[name[4:]] = value
+        identity = self._trace_access_identity(event)
+        if identity:
+            info.update(identity)
         return self._trace_jsonable(info)
 
     def _trace_response_metadata(self, response: Any) -> dict[str, Any]:
@@ -3827,63 +3995,73 @@ class GPTImage2Plugin(Star):
             chain.append(Image.fromFileSystem(str(image_path)))
         return chain
 
+    def _trace_query_prompt(self, trace: dict[str, Any]) -> tuple[str, str]:
+        """Prefer the payload paired with a successful API attempt, not a preview."""
+        pending: dict[str, str] = {}
+        successful_prompt = ""
+        last_request_prompt = ""
+        stages = trace.get("stages") if isinstance(trace.get("stages"), list) else []
+        for stage in stages:
+            if not isinstance(stage, dict) or stage.get("name") != "image_api":
+                continue
+            profile = str(stage.get("profile") or "")
+            payload = stage.get("payload")
+            prompt = payload.get("prompt") if isinstance(payload, dict) else None
+            if stage.get("status") == "started" and isinstance(prompt, str) and prompt:
+                pending[profile] = prompt
+                last_request_prompt = prompt
+            elif stage.get("status") == "failed":
+                pending.pop(profile, None)
+            elif stage.get("status") == "succeeded":
+                value = prompt if isinstance(prompt, str) and prompt else pending.get(profile, "")
+                if value:
+                    successful_prompt = value
+        if successful_prompt:
+            return "最终提交提示词（接口成功）", successful_prompt
+        final_prompt = trace.get("final_prompt")
+        if isinstance(final_prompt, str) and final_prompt:
+            return "最终提示词（记录值，未核对成功请求）", final_prompt
+        if last_request_prompt:
+            return "请求提示词（未确认接口成功）", last_request_prompt
+        return "最终提示词", "尚未产生最终提示词。"
+
     def _format_trace_summary(self, trace: dict[str, Any]) -> str:
         stages = trace.get("stages") if isinstance(trace.get("stages"), list) else []
-        preprocess = self._last_trace_stage(
-            stages,
-            ("description_reference_prompt", "persona_rewrite"),
-        )
-        enhance = self._last_trace_stage(stages, ("prompt_enhance",))
-        prompt_build = self._last_trace_stage(stages, ("prompt_build",))
-        compression = self._last_trace_stage(stages, ("prompt_compression",))
-        api_stage = self._last_trace_stage(stages, ("image_api",))
-        result = trace.get("result") if isinstance(trace.get("result"), dict) else {}
-
+        api = trace.get("api") if isinstance(trace.get("api"), dict) else {}
         lines = [
-            f"流程ID：{trace.get('flow_id', '')}",
-            f"状态：{self._trace_status_label(str(trace.get('status', '')))}",
-            f"类型：{self._trace_operation_label(str(trace.get('operation', '')))}；入口：{trace.get('trigger', '')}",
-            f"创建时间：{trace.get('created_at_text', '')}",
+            f"流程ID：{self._clip_trace_text(trace.get('flow_id', ''), limit=80)}",
+            f"状态：{self._trace_status_label(str(trace.get('status', '')))}；类型：{self._trace_operation_label(str(trace.get('operation', '')))}",
+            f"入口：{self._clip_trace_text(trace.get('trigger', ''), limit=40)}；模型：{self._clip_trace_text(api.get('model', ''), limit=80) or '未记录'}",
+            f"创建时间：{self._clip_trace_text(trace.get('created_at_text', ''), limit=32)}",
         ]
-        raw_prompt = self._clip_trace_text(trace.get("raw_user_prompt", ""))
-        initial_prompt = self._clip_trace_text(trace.get("initial_prompt", ""))
-        lines.append(f"原始需求：{raw_prompt}")
-        if initial_prompt and initial_prompt != raw_prompt:
-            lines.append(f"入口提示词：{initial_prompt}")
-        if preprocess:
-            output_prompt = self._clip_trace_text(preprocess.get("output_prompt", ""))
-            if output_prompt:
-                lines.append(f"预处理输出：{output_prompt}")
-        if enhance:
-            if enhance.get("status") == "failed":
-                lines.append(f"增强提示词：失败，{self._clip_trace_text(enhance.get('error', ''))}")
-            elif enhance.get("output_prompt"):
-                lines.append(f"增强提示词：{self._clip_trace_text(enhance.get('output_prompt', ''))}")
-        if prompt_build and prompt_build.get("output_prompt"):
-            lines.append(f"拼装后提示词：{self._clip_trace_text(prompt_build.get('output_prompt', ''))}")
-        if compression:
-            if compression.get("status") == "failed":
-                lines.append(f"关键词压缩：失败，{self._clip_trace_text(compression.get('error', ''))}")
-            elif compression.get("output_prompt"):
-                lines.append(f"关键词压缩后：{self._clip_trace_text(compression.get('output_prompt', ''))}")
-        if trace.get("final_prompt"):
-            lines.append(f"最终提交提示词：{self._clip_trace_text(trace.get('final_prompt', ''))}")
-        references = trace.get("reference_images") if isinstance(trace.get("reference_images"), list) else []
-        if references:
+        label, final_prompt = self._trace_query_prompt(trace)
+        # Reserve the first and largest part of the reply for the actual prompt.
+        # Other stages are summarized below instead of repeating every full text.
+        prompt_limit = min(TRACE_PROMPT_PREVIEW_LIMIT, max(200, TRACE_QUERY_TEXT_LIMIT - len("\n".join(lines)) - 160))
+        lines.append(f"{label}：\n{final_prompt[:prompt_limit]}")
+        if len(final_prompt) > prompt_limit:
+            lines.append(f"……提示词已截断（完整 {len(final_prompt)} 字）；完整记录由管理员在 traces 中查看。")
+        raw_prompt = str(trace.get("raw_user_prompt") or "").strip()
+        if raw_prompt and raw_prompt != final_prompt:
+            lines.append(f"原始需求：{self._clip_trace_text(raw_prompt, limit=160)}")
+        stage_summary = " → ".join(
+            f"{stage.get('name', '')}:{stage.get('status', '')}"
+            for stage in stages if isinstance(stage, dict)
+        )
+        if stage_summary:
+            lines.append(f"处理阶段：{self._clip_trace_text(stage_summary, limit=180)}")
+        references = trace.get("reference_images")
+        if isinstance(references, list) and references:
             lines.append(f"参考图：{len(references)} 张")
-        if result.get("image_path"):
-            lines.append(f"输出图片：{result.get('image_path')}")
-        if result.get("revised_prompt"):
-            lines.append(f"接口修订提示词：{self._clip_trace_text(result.get('revised_prompt', ''))}")
-        if trace.get("error"):
-            lines.append(f"错误：{self._clip_trace_text(trace.get('error', ''), limit=600)}")
-        elif api_stage and api_stage.get("status") == "failed":
-            lines.append(f"接口错误：{self._clip_trace_text(api_stage.get('error', ''), limit=600)}")
-
-        text = "\n".join(str(line) for line in lines if str(line).strip())
+        api_stage = self._last_trace_stage(stages, ("image_api",))
+        error = trace.get("error") or ((api_stage or {}).get("error") if (api_stage or {}).get("status") == "failed" else "")
+        if error:
+            lines.append(f"错误：{self._clip_trace_text(error, limit=180)}")
+        text = "\n".join(lines)
         if len(text) <= TRACE_QUERY_TEXT_LIMIT:
             return text
-        return text[:TRACE_QUERY_TEXT_LIMIT].rstrip() + "\n……内容较长，完整记录已保存在 bot 机器的 traces 目录。"
+        notice = "\n……摘要已截断；完整记录由管理员在 traces 中查看。"
+        return text[:TRACE_QUERY_TEXT_LIMIT - len(notice)].rstrip() + notice
 
     def _last_trace_stage(self, stages: list[Any], names: tuple[str, ...]) -> dict[str, Any] | None:
         for stage in reversed(stages):
@@ -3927,6 +4105,7 @@ class GPTImage2Plugin(Star):
         style: str,
         transparent_background: bool,
         reference_paths: list[str],
+        render_options: dict[str, Any] | None = None,
     ) -> str:
         payload = {
             "scope": self._event_scope_key(event),
@@ -3938,6 +4117,10 @@ class GPTImage2Plugin(Star):
             "style": (style or "").strip(),
             "transparent_background": bool(transparent_background),
             "reference_paths": [str(Path(path).resolve()) for path in reference_paths],
+            "render_options": render_options or self._resolve_render_options(
+                size=size, aspect_ratio=aspect_ratio, resolution=resolution,
+                reference_image_paths=reference_paths,
+            ),
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -4094,19 +4277,52 @@ class GPTImage2Plugin(Star):
             "quality": "",
             "style": "",
             "transparent_background": False,
+            "output_format": "",
+            "frame_count": None,
+            "frame_duration_ms": None,
         }
         if not text:
             return opts, ""
 
         try:
-            tokens = shlex.split(text)
-        except ValueError:
-            tokens = text.split()
+            shlex.split(text)
+            token_spans = list(re.finditer(r'''(?:[^\s"'\\]|\\.|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')+''', text))
+            tokens = [shlex.split(match.group())[0] for match in token_spans]
+        except (ValueError, IndexError):
+            token_spans = list(re.finditer(r"\S+", text))
+            tokens = [match.group() for match in token_spans]
 
         prompt_parts: list[str] = []
+        prompt_indexes: list[int] = []
+        invalid_option = False
+        value_flags = {
+            "--size", "-s", "--ratio", "--aspect", "--aspect-ratio", "--比例",
+            "--resolution", "--res", "--分辨率", "--quality", "-q", "--style",
+            "--format", "--frames", "--frame-ms",
+        }
         i = 0
         while i < len(tokens):
             token = tokens[i]
+            if token_spans[i].group().startswith(("\"", "'", "\\")):
+                prompt_indexes.append(i)
+                i += 1
+                continue
+            if token in value_flags and (
+                i + 1 >= len(tokens) or token_spans[i + 1].group().startswith("--")
+            ):
+                invalid_option = True
+                i += 1
+                continue
+            gif_flags = {"--format": "output_format", "--frames": "frame_count", "--frame-ms": "frame_duration_ms"}
+            flag, separator, inline_value = token.partition("=")
+            if flag in gif_flags:
+                has_following_value = i + 1 < len(tokens) and not tokens[i + 1].startswith("--")
+                value = inline_value if separator else tokens[i + 1] if has_following_value else ""
+                if not value.strip():
+                    invalid_option = True
+                opts[gif_flags[flag]] = value if value.strip() else "__missing__"
+                i += 1 if separator or not has_following_value else 2
+                continue
             if token in {"--size", "-s"} and i + 1 < len(tokens):
                 self._assign_size_like_option(opts, tokens[i + 1])
                 i += 2
@@ -4151,10 +4367,18 @@ class GPTImage2Plugin(Star):
                 opts["transparent_background"] = True
                 i += 1
                 continue
-            prompt_parts.append(token)
+            prompt_indexes.append(i)
             i += 1
 
-        return opts, " ".join(prompt_parts).strip()
+        previous = None
+        for index in prompt_indexes:
+            if previous is not None:
+                prompt_parts.append(text[token_spans[previous].end():token_spans[index].start()] if index == previous + 1 else " ")
+            prompt_parts.append(token_spans[index].group())
+            previous = index
+        if invalid_option:
+            opts["output_format"] = "__missing__"
+        return opts, "".join(prompt_parts).strip()
 
     def _assign_size_like_option(self, opts: dict[str, Any], value: str) -> None:
         normalized = (value or "").strip().lower()
@@ -4165,8 +4389,7 @@ class GPTImage2Plugin(Star):
             if ":" in normalized or "：" in normalized:
                 opts["aspect_ratio"] = normalized.replace("：", ":")
             else:
-                pixel_size = self._normalize_pixel_size(normalized)
-                opts["size"] = pixel_size or "auto"
+                opts["size"] = normalized
             return
         if normalized in VALID_RESOLUTIONS:
             opts["resolution"] = normalized
@@ -4187,13 +4410,20 @@ class GPTImage2Plugin(Star):
         self,
         event: AstrMessageEvent,
         *,
-        include_recent: bool = True,
+        include_recent: bool = False,
+        stabilize: bool = False,
+        source_records: list[dict[str, str]] | None = None,
     ) -> list[str]:
+        # Retained only for compatibility with older callers. A previous chat
+        # image is never evidence that the user selected it for this request.
+        del include_recent
+        if source_records is not None:
+            source_records.clear()
         max_images = self._max_reference_images()
         paths: list[str] = []
         seen: set[str] = set()
 
-        async def add_image(component: Image) -> None:
+        async def add_image(component: Image, source: str) -> None:
             if len(paths) >= max_images:
                 return
             try:
@@ -4205,12 +4435,14 @@ class GPTImage2Plugin(Star):
             if normalized not in seen:
                 seen.add(normalized)
                 paths.append(normalized)
+                if source_records is not None:
+                    source_records.append({"path": normalized, "source": source})
 
-        async def walk(chain: Any) -> None:
+        async def walk(chain: Any, source: str = "current_message") -> None:
             if not chain or len(paths) >= max_images:
                 return
             if isinstance(chain, Image):
-                await add_image(chain)
+                await add_image(chain, source)
                 return
             if not isinstance(chain, (list, tuple)):
                 return
@@ -4218,21 +4450,22 @@ class GPTImage2Plugin(Star):
             for component in chain:
                 if len(paths) >= max_images:
                     break
+                component_source = "quoted_message" if isinstance(component, Reply) else source
                 if isinstance(component, Image):
-                    await add_image(component)
+                    await add_image(component, component_source)
 
                 nested_chain = getattr(component, "chain", None)
                 if nested_chain:
-                    await walk(nested_chain)
+                    await walk(nested_chain, component_source)
 
                 nested_content = getattr(component, "content", None)
                 if nested_content:
-                    await walk(nested_content)
+                    await walk(nested_content, component_source)
 
                 nested_nodes = getattr(component, "nodes", None)
                 if nested_nodes:
                     for node in nested_nodes:
-                        await walk(getattr(node, "content", None))
+                        await walk(getattr(node, "content", None), component_source)
 
         try:
             message_chain = event.get_messages()
@@ -4242,65 +4475,12 @@ class GPTImage2Plugin(Star):
 
         await walk(message_chain)
         if len(paths) < max_images:
-            await self._add_quoted_reference_image_paths(event, paths, seen, max_images)
-        if not paths and include_recent:
-            paths.extend(self._recent_reference_image_paths(event, max_images=max_images))
+            await self._add_quoted_reference_image_paths(
+                event, paths, seen, max_images, source_records=source_records,
+            )
+        if stabilize and paths:
+            paths = await self._stabilize_reference_image_paths(paths, source_records=source_records)
         return paths
-
-    def _recent_reference_ttl_seconds(self) -> int:
-        return max(0, self._int_cfg("runtime", "recent_reference_ttl_seconds", 180))
-
-    def _remember_recent_reference_images(self, event: AstrMessageEvent, paths: list[str]) -> None:
-        ttl = self._recent_reference_ttl_seconds()
-        if ttl <= 0:
-            return
-        valid_paths = [os.path.abspath(path) for path in paths if path and os.path.exists(path)]
-        if not valid_paths:
-            return
-        scope = self._event_scope_key(event)
-        self._recent_reference_images[scope] = (time.time(), valid_paths[: self._max_reference_images()])
-        self._cleanup_recent_reference_images()
-        logger.info(
-            "GPT Image cached recent reference images scope=%s count=%d ttl=%ds",
-            scope,
-            len(valid_paths),
-            ttl,
-        )
-
-    def _recent_reference_image_paths(self, event: AstrMessageEvent, *, max_images: int) -> list[str]:
-        ttl = self._recent_reference_ttl_seconds()
-        if ttl <= 0:
-            return []
-        scope = self._event_scope_key(event)
-        cached = self._recent_reference_images.get(scope)
-        if not cached:
-            return []
-        created_at, paths = cached
-        age = time.time() - created_at
-        if age > ttl:
-            self._recent_reference_images.pop(scope, None)
-            return []
-        valid_paths = [os.path.abspath(path) for path in paths if path and os.path.exists(path)]
-        if not valid_paths:
-            self._recent_reference_images.pop(scope, None)
-            return []
-        logger.info(
-            "GPT Image using recent reference images scope=%s count=%d age=%.1fs",
-            scope,
-            len(valid_paths[:max_images]),
-            age,
-        )
-        return valid_paths[:max_images]
-
-    def _cleanup_recent_reference_images(self) -> None:
-        ttl = self._recent_reference_ttl_seconds()
-        if ttl <= 0:
-            self._recent_reference_images.clear()
-            return
-        now = time.time()
-        for scope, (created_at, paths) in list(self._recent_reference_images.items()):
-            if now - created_at > ttl or not any(os.path.exists(path) for path in paths):
-                self._recent_reference_images.pop(scope, None)
 
     async def _add_quoted_reference_image_paths(
         self,
@@ -4308,6 +4488,8 @@ class GPTImage2Plugin(Star):
         paths: list[str],
         seen: set[str],
         max_images: int,
+        *,
+        source_records: list[dict[str, str]] | None = None,
     ) -> None:
         try:
             quoted_image_refs = await extract_quoted_message_images(event)
@@ -4333,6 +4515,8 @@ class GPTImage2Plugin(Star):
             if normalized not in seen:
                 seen.add(normalized)
                 paths.append(normalized)
+                if source_records is not None:
+                    source_records.append({"path": normalized, "source": "quoted_message"})
                 added += 1
 
         if quoted_image_refs:
@@ -4383,19 +4567,118 @@ class GPTImage2Plugin(Star):
 
         raise RuntimeError("quoted image ref is not a resolvable file or URL")
 
+    async def _stabilize_reference_image_paths(
+        self, paths: list[str], *, source_records: list[dict[str, str]] | None = None,
+    ) -> list[str]:
+        """Copy event-owned references into the plugin cache before background work."""
+
+        prepared = self._prepare_reference_image_paths(paths)
+        stable_paths: list[str] = []
+        sources_by_path = {
+            os.path.abspath(record["path"]): record.get("source", "explicit_selection")
+            for record in (source_records or []) if record.get("path")
+        }
+        stable_sources: list[dict[str, str]] = []
+        seen_digests: set[str] = set()
+        copied = 0
+        reused = 0
+        deduplicated = 0
+        image_dir = self._image_dir.resolve()
+
+        for image_path in prepared:
+            source = Path(image_path).resolve()
+            digest = await asyncio.to_thread(self._reference_file_sha256, source)
+            if digest in seen_digests:
+                deduplicated += 1
+                continue
+            seen_digests.add(digest)
+
+            try:
+                source.relative_to(image_dir)
+                target = source
+                reused += 1
+            except ValueError:
+                content_type = self._detect_image_content_type(str(source))
+                suffix = {
+                    "image/png": ".png",
+                    "image/jpeg": ".jpg",
+                    "image/webp": ".webp",
+                }[content_type]
+                target = image_dir / f"gpt_image_ref_{digest}{suffix}"
+                if not target.exists():
+                    temporary_target = image_dir / f".{target.name}.{uuid.uuid4().hex}.tmp"
+                    try:
+                        await asyncio.to_thread(shutil.copy2, source, temporary_target)
+                        os.replace(temporary_target, target)
+                    finally:
+                        temporary_target.unlink(missing_ok=True)
+                    copied += 1
+                else:
+                    target.touch()
+                    reused += 1
+
+            stable_paths.append(str(target))
+            if source_records is not None:
+                stable_sources.append({
+                    "path": str(target),
+                    "source": sources_by_path.get(os.path.abspath(image_path), "explicit_selection"),
+                })
+
+        logger.info(
+            "GPT Image stabilized reference images count=%d copied=%d reused=%d deduplicated=%d",
+            len(stable_paths),
+            copied,
+            reused,
+            deduplicated,
+        )
+        if source_records is not None:
+            source_records[:] = stable_sources
+        return stable_paths
+
+    @staticmethod
+    def _reference_file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as file_obj:
+            for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def _prepare_reference_image_paths(self, paths: list[str]) -> list[str]:
         prepared: list[str] = []
+        seen: set[str] = set()
+        rejected: list[str] = []
         for image_path in paths[: self._max_reference_images()]:
             path = os.path.abspath(image_path)
-            if not os.path.exists(path):
-                raise RuntimeError(f"参考图不存在：{path}")
-            size = os.path.getsize(path)
+            if path in seen:
+                continue
+            seen.add(path)
+            name = Path(path).name or "unnamed"
+            if not os.path.isfile(path):
+                rejected.append(f"{name}:missing")
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError as exc:
+                rejected.append(f"{name}:{type(exc).__name__}")
+                continue
             if size > MAX_REFERENCE_IMAGE_BYTES:
-                raise RuntimeError(f"参考图超过 50MB：{Path(path).name}")
+                rejected.append(f"{name}:too_large")
+                continue
             content_type = self._detect_image_content_type(path)
             if content_type not in VALID_INPUT_CONTENT_TYPES:
-                raise RuntimeError(f"参考图格式不支持：{Path(path).name}。请使用 png、jpg/jpeg 或 webp。")
+                rejected.append(f"{name}:unsupported")
+                continue
             prepared.append(path)
+
+        if paths and not prepared:
+            details = ", ".join(rejected[:3]) or "unavailable"
+            raise RuntimeError(f"没有可用参考图（{details}），请重新发送或引用图片后再试。")
+        if rejected:
+            logger.warning(
+                "GPT Image skipped unusable reference images count=%d details=%s",
+                len(rejected),
+                ", ".join(rejected[:5]),
+            )
         return prepared
 
     def _max_reference_images(self) -> int:
@@ -4612,7 +4895,7 @@ class GPTImage2Plugin(Star):
     def _normalize_resolution(self, resolution: str | None) -> str:
         value = (resolution or "").strip().lower()
         if not value:
-            value = self._str_cfg("image", "resolution", "1k").lower()
+            value = self._str_cfg("image", "resolution", "auto").lower()
         value = value.replace(" ", "")
         if value in {"1", "1k", "1024", "1024p"}:
             return "1k"
@@ -4759,8 +5042,74 @@ class GPTImage2Plugin(Star):
         value = self._str_cfg("image", "output_format", "png").lower()
         return value if value in VALID_OUTPUT_FORMATS else "png"
 
-    def _images_generation_url(self) -> str:
-        base_url = self._base_url().rstrip("/")
+    def _resolve_render_options(
+        self,
+        *,
+        output_format: str | None = None,
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
+        size: str | None = None,
+        reference_image_paths: list[str] | None = None,
+        aspect_ratio: str | None = None,
+        resolution: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate and freeze the format and native GIF controls before awaits.
+
+        Args:
+            output_format: Explicit output format, or the configured default.
+            frame_count: Explicit GIF frame count, or the configured default.
+            frame_duration_ms: Explicit GIF frame duration, or its default.
+            size: Exact GIF pixel dimensions, or the configured size.
+            reference_image_paths: Selected references, forbidden for GIF.
+            aspect_ratio: Explicit ratio; GIF accepts only empty or auto.
+            resolution: Explicit resolution tier; GIF accepts only empty or auto.
+
+        Returns:
+            A per-job snapshot of the normalized rendering settings.
+
+        Raises:
+            RuntimeError: If the requested settings cannot be honored.
+        """
+        selected_format = (output_format or self._str_cfg("image", "output_format", "png")).strip().lower()
+        if selected_format not in VALID_OUTPUT_FORMATS:
+            raise RuntimeError("输出格式只能为 png、jpeg、webp 或 gif。")
+        if selected_format != "gif" and (frame_count is not None or frame_duration_ms is not None):
+            raise RuntimeError("帧数和每帧时长仅适用于 GIF 动图；请指定 --format gif，或移除帧参数。")
+        options: dict[str, Any] = {"output_format": selected_format}
+        if selected_format == "gif":
+            if not self._bool_cfg("gif", "enabled", False):
+                raise RuntimeError("GIF 功能未开启。请在插件配置的“GIF 动图”中启用，并确认使用支持原生 GIF 的官方 API 源及完整透传参数的中转。")
+            if reference_image_paths:
+                raise RuntimeError("本插件的 GIF 动图目前仅支持纯文字生成，不支持参考图或改图；本次不会丢弃参考图或改成静态图片。")
+            if any(str(value or "").strip().lower() not in {"", "auto"} for value in (aspect_ratio, resolution)):
+                raise RuntimeError("GIF 不支持显式比例或清晰度档位，请移除 --ratio/--resolution，改用 --size 指定宽高均为 16 倍数的像素尺寸，例如 512x512。")
+            settings = self._section("gif")
+            values = {
+                "frame_count": frame_count if frame_count is not None else settings.get("frame_count", 9),
+                "frame_duration_ms": frame_duration_ms if frame_duration_ms is not None else settings.get("frame_duration_ms", 200),
+            }
+            for key, value in values.items():
+                if isinstance(value, bool) or not (
+                    isinstance(value, int) or isinstance(value, str) and re.fullmatch(r"\d+", value)
+                ):
+                    raise RuntimeError("GIF 帧数和每帧时长必须为整数。")
+                number = int(value)
+                minimum, maximum = (2, 16) if key == "frame_count" else (20, 2000)
+                if not minimum <= number <= maximum:
+                    raise RuntimeError("GIF 帧数须为 2–16，每帧时长须为 20–2000 毫秒。")
+                options[key] = (number + 5) // 10 * 10 if key == "frame_duration_ms" else number
+            gif_size = (size or self._str_cfg("gif", "size", "auto") or "auto").strip().lower()
+            gif_size = gif_size.replace("×", "x").replace("*", "x").replace(" ", "")
+            if gif_size != "auto":
+                match = re.fullmatch(r"(\d+)x(\d+)", gif_size)
+                if not match or any(int(side) <= 0 or int(side) % 16 for side in match.groups()):
+                    raise RuntimeError("GIF 像素尺寸须为 auto，或宽和高均为 16 的正整数倍，例如 512x512。")
+                gif_size = "x".join(str(int(side)) for side in match.groups())
+            options["size"] = gif_size
+        return options
+
+    def _images_generation_url(self, base_url: str | None = None) -> str:
+        base_url = (base_url if base_url is not None else self._base_url()).rstrip("/")
         if base_url.endswith("/images/generations"):
             return base_url
         if base_url.endswith("/images/edits"):
@@ -4769,8 +5118,8 @@ class GPTImage2Plugin(Star):
             return f"{base_url}/images/generations"
         return f"{base_url}/v1/images/generations"
 
-    def _images_edit_url(self) -> str:
-        base_url = self._base_url().rstrip("/")
+    def _images_edit_url(self, base_url: str | None = None) -> str:
+        base_url = (base_url if base_url is not None else self._base_url()).rstrip("/")
         if base_url.endswith("/images/edits"):
             return base_url
         if base_url.endswith("/images/generations"):
@@ -4779,127 +5128,23 @@ class GPTImage2Plugin(Star):
             return f"{base_url}/images/edits"
         return f"{base_url}/v1/images/edits"
 
-    def _new_api_active(self) -> bool:
-        """Whether the merged ``api`` config block is filled in by the user.
+    def _model_name(self, *, advanced: bool = False) -> str:
+        return self._resolve_image_api_connection(advanced=advanced)["model"]
 
-        Schema defaults populate ``api.base_url`` / ``api.model`` /
-        ``api.timeout_seconds`` automatically, so we cannot rely solely on
-        them being present. We treat the new block as active when:
-
-        * the user has set ``api.api_key`` (most explicit signal); or
-        * any of ``base_url`` / ``model`` / ``timeout_seconds`` differs from
-          the schema defaults (the user has clearly customized the new
-          block even though they leave the key in an env var).
-
-        This avoids the bug where a legacy ``openai`` block silently wins
-        over a freshly customized ``api.base_url`` when the key only lives
-        in ``OPENAI_API_KEY`` / ``TWO_API_KEY``.
-        """
-        if self._str_cfg("api", "api_key", ""):
-            return True
-
-        section = self._section("api")
-        base_url = self._str_cfg("api", "base_url", "")
-        if base_url and base_url != DEFAULT_API_BASE_URL:
-            return True
-        model = self._str_cfg("api", "model", "")
-        if model and model != DEFAULT_API_MODEL:
-            return True
-        raw_timeout = section.get("timeout_seconds")
-        if raw_timeout is not None:
-            try:
-                if int(raw_timeout) != DEFAULT_API_TIMEOUT:
-                    return True
-            except (TypeError, ValueError):
-                pass
-        return False
-
-    def _legacy_preferred_section(self) -> str:
-        """Pick the legacy block the user was actively using.
-
-        Defaults match the previous schema (``openai.enabled=true``,
-        ``two_api.enabled=false``). When the user explicitly flipped to 2api,
-        we honor that.
-        """
-        two_api_enabled = self._bool_cfg("two_api", "enabled", False)
-        openai_enabled = self._bool_cfg("openai", "enabled", True)
-        if two_api_enabled and not openai_enabled:
-            return "two_api"
-        return "openai"
-
-    def _legacy_section_enabled(self, section: str) -> bool:
-        if section == "two_api":
-            return self._bool_cfg("two_api", "enabled", False)
-        return self._bool_cfg("openai", "enabled", True)
-
-    def _legacy_lookup(self, key: str) -> str:
-        """Walk the legacy ``openai`` / ``two_api`` blocks for a string value.
-
-        Respects the legacy ``enabled`` toggles so a user who explicitly
-        disabled a block does not have its values silently picked up.
-        """
-        preferred = self._legacy_preferred_section()
-        order = [preferred] + [s for s in ("openai", "two_api") if s != preferred]
-        for section in order:
-            if not self._legacy_section_enabled(section):
-                continue
-            value = self._str_cfg(section, key, "")
-            if value:
-                return value
-        return ""
-
-    def _legacy_lookup_int(self, key: str) -> int | None:
-        preferred = self._legacy_preferred_section()
-        order = [preferred] + [s for s in ("openai", "two_api") if s != preferred]
-        for section in order:
-            if not self._legacy_section_enabled(section):
-                continue
-            raw = self._section(section).get(key)
-            if raw is None:
-                continue
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _model_name(self) -> str:
-        if self._new_api_active():
-            return self._str_cfg("api", "model", DEFAULT_API_MODEL) or DEFAULT_API_MODEL
-        legacy = self._legacy_lookup("model")
-        if legacy:
-            return legacy
-        # Super-old config block (pre openai/two_api split) reused the same
-        # ``api`` section name as the new merged config.
-        return self._str_cfg("api", "model", DEFAULT_API_MODEL) or DEFAULT_API_MODEL
-
-    def _base_url(self) -> str:
-        if self._new_api_active():
-            return self._str_cfg("api", "base_url", DEFAULT_API_BASE_URL) or DEFAULT_API_BASE_URL
-        legacy = self._legacy_lookup("base_url")
-        if legacy:
-            return legacy
-        return self._str_cfg("api", "base_url", DEFAULT_API_BASE_URL) or DEFAULT_API_BASE_URL
+    def _base_url(self, *, advanced: bool = False) -> str:
+        return self._resolve_image_api_connection(advanced=advanced)["base_url"]
 
     def _timeout_seconds(self) -> int:
-        if self._new_api_active():
-            return self._int_cfg("api", "timeout_seconds", DEFAULT_API_TIMEOUT)
-        legacy = self._legacy_lookup_int("timeout_seconds")
-        if legacy is not None:
-            return legacy
         return self._int_cfg("api", "timeout_seconds", DEFAULT_API_TIMEOUT)
 
-    def _base_url_prefers_standard_profile(self) -> bool:
-        base_url = self._base_url().lower()
+    def _base_url_prefers_standard_profile(self, base_url: str | None = None) -> bool:
+        base_url = (base_url if base_url is not None else self._base_url()).lower()
         standard_markers = (
             "ruoli.dev",
             "localhost:3000",
             "127.0.0.1:3000",
         )
-        private_host_pattern = r"https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}):3000(?:/|$)"
-        return any(marker in base_url for marker in standard_markers) or bool(
-            re.search(private_host_pattern, base_url)
-        )
+        return any(marker in base_url for marker in standard_markers)
 
     def _auto_detect_profile(
         self,
@@ -4908,6 +5153,7 @@ class GPTImage2Plugin(Star):
         size: str | None,
         aspect_ratio: str | None,
         reference_image_paths: list[str] | None,
+        base_url: str | None = None,
     ) -> str:
         """Pick an initial compat profile when the cache misses.
 
@@ -4915,7 +5161,7 @@ class GPTImage2Plugin(Star):
         the request with a parameter-format error the caller will retry once
         with the other profile.
         """
-        if self._base_url_prefers_standard_profile():
+        if self._base_url_prefers_standard_profile(base_url):
             return "standard"
 
         # An explicit pixel size unambiguously speaks the strict OpenAI
@@ -4945,6 +5191,7 @@ class GPTImage2Plugin(Star):
         size: str | None,
         aspect_ratio: str | None,
         reference_image_paths: list[str] | None,
+        base_url: str | None = None,
     ) -> bool:
         """Whether this request should override the cached compat profile.
 
@@ -4953,7 +5200,7 @@ class GPTImage2Plugin(Star):
         edit request that should follow the reference image is a stronger
         signal than whatever succeeded on an earlier request.
         """
-        if self._base_url_prefers_standard_profile():
+        if self._base_url_prefers_standard_profile(base_url):
             return True
         if self._normalize_pixel_size(size):
             return True
@@ -5053,6 +5300,8 @@ class GPTImage2Plugin(Star):
 
     def _image_suffix_from_bytes(self, data: bytes, content_type: str = "") -> str:
         content_type = (content_type or "").split(";", 1)[0].strip().lower()
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
         if content_type == "image/png" or data.startswith(b"\x89PNG\r\n\x1a\n"):
             return ".png"
         if content_type in {"image/jpeg", "image/jpg"} or data.startswith(b"\xff\xd8"):
@@ -5061,11 +5310,144 @@ class GPTImage2Plugin(Star):
             return ".webp"
         return ""
 
-    def _api_headers(self, api_key: str, *, content_type: str | None = None) -> dict[str, str]:
+    def _validate_generated_gif(self, data: bytes, *, render_options: dict[str, Any] | None = None) -> None:
+        """Reject a static or corrupt upstream response without altering bytes.
+
+        Args:
+            data: Original bytes returned by the image provider.
+            render_options: Frozen requested animation settings, when available.
+
+        Raises:
+            RuntimeError: If the response is not a decodable multi-frame GIF.
+        """
+        if not data.startswith((b"GIF87a", b"GIF89a")):
+            raise RuntimeError("请求的是 GIF 动图，但供应商返回了其他格式；本次不会发送静态图片代替。")
+        try:
+            from io import BytesIO
+            from PIL import Image as PILImage
+
+            with PILImage.open(BytesIO(data)) as animation:
+                frame_total = getattr(animation, "n_frames", 1)
+                if animation.format != "GIF" or not 2 <= frame_total <= 16:
+                    raise ValueError("not animated")
+                durations = []
+                for frame in range(frame_total):
+                    animation.seek(frame)
+                    animation.load()
+                    durations.append(animation.info.get("duration", 0))
+        except ImportError:
+            raise RuntimeError("当前环境缺少 GIF 校验支持，已停止发送，请管理员检查 Pillow 依赖。") from None
+        except Exception:
+            raise RuntimeError("供应商没有返回有效的 2–16 帧 GIF 动图；本次不会发送静态图或损坏文件代替。") from None
+        if render_options and (
+            frame_total != render_options["frame_count"]
+            or any(duration != render_options["frame_duration_ms"] for duration in durations)
+        ):
+            raise RuntimeError(
+                "供应商返回的 GIF 未按请求设置帧数或播放速度，已停止发送。"
+                f"请求 {render_options['frame_count']} 帧、每帧 {render_options['frame_duration_ms']} 毫秒；"
+                f"实际 {frame_total} 帧、每帧时长有 {sorted(set(durations))} 毫秒。"
+            )
+
+    def _resolve_image_api_connection(self, *, advanced: bool = False) -> dict[str, Any]:
+        """Snapshot the selected provider connection without persisting secrets.
+
+        Args:
+            advanced: Select the independently configured Plan image model.
+
+        Returns:
+            A per-request connection containing the selected provider ID, model,
+            base URL, current credential, and independent request headers.
+
+        Raises:
+            RuntimeError: If the selection or its Images API connection is not
+                usable. Errors deliberately omit credentials and raw values.
+        """
+        selector = "advanced_provider_id" if advanced else "normal_provider_id"
+        tier_name = "高级生图模型（/plan）" if advanced else "普通生图模型"
+        provider_id = self._str_cfg("api", selector, "").strip()
+        if not provider_id:
+            raise RuntimeError(f"请先在插件的“模型选择”中选择 AstrBot 已配置的{tier_name}。")
+        try:
+            provider = self.context.get_provider_by_id(provider_id)
+        except Exception:
+            raise RuntimeError("无法读取所选生图供应商，请检查 AstrBot 供应商配置。") from None
+        if provider is None:
+            raise RuntimeError("所选生图供应商不存在、已停用或未加载，请重新选择已启用的供应商。")
+        config = getattr(provider, "provider_config", None)
+        if not isinstance(config, dict) or config.get("enable") is False:
+            raise RuntimeError("所选生图供应商配置不可用或已停用，请重新选择。")
+        if config.get("type") not in {"openai_chat_completion", "openai_responses"} or "api_version" in config:
+            raise RuntimeError("请选择 OpenAI 兼容供应商，且该供应商须支持 Images 生图接口；暂不支持 Azure、Gemini 或 Anthropic 原生接口。")
+        try:
+            model = provider.get_model()
+            api_key = provider.get_current_key()
+            client = getattr(provider, "client", None)
+            effective_base = getattr(client, "base_url", None)
+            base_url = str(effective_base or config.get("api_base") or "").strip().rstrip("/")
+        except Exception:
+            raise RuntimeError("无法读取所选供应商的连接信息，请检查其地址和 API Key。") from None
+        if not isinstance(model, str) or not model.strip() or any(ord(char) < 32 or ord(char) == 127 for char in model):
+            raise RuntimeError("所选生图模型的模型名称无效，请在 AstrBot 模型设置中检查。")
+        if not isinstance(api_key, str) or not api_key.strip() or any(ord(char) < 32 or ord(char) == 127 for char in api_key):
+            raise RuntimeError("所选生图供应商没有有效的 API Key，请在 AstrBot 供应商设置中配置。")
+        try:
+            parsed = urlsplit(base_url)
+            valid_url = (
+                parsed.scheme in {"http", "https"}
+                and bool(parsed.hostname)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in base_url)
+            )
+            # Accessing port also validates malformed and out-of-range values.
+            parsed.port
+        except (TypeError, ValueError):
+            valid_url = False
+        if not valid_url:
+            raise RuntimeError("所选生图供应商的 API 地址无效：须为 HTTP(S) 地址，且不能含账号、密码或查询参数。")
+        headers = self._api_headers(api_key.strip(), custom_headers=config.get("custom_headers"))
+        return {
+            "provider_id": provider_id,
+            "model": model.strip(),
+            "base_url": base_url,
+            "api_key": api_key.strip(),
+            "headers": headers,
+        }
+
+    def _api_headers(
+        self,
+        api_key: str,
+        *,
+        content_type: str | None = None,
+        custom_headers: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "User-Agent": self._user_agent(),
         }
+        reserved = {"authorization", "content-type", "content-length", "host", "connection", "transfer-encoding", "proxy-authorization"}
+        if isinstance(custom_headers, dict):
+            for name, value in custom_headers.items():
+                if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                    raise RuntimeError("所选供应商的自定义请求头无效，请在 AstrBot 供应商设置中检查。")
+                if name.lower() in reserved:
+                    continue
+                if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                    raise RuntimeError("所选供应商的自定义请求头无效，请在 AstrBot 供应商设置中检查。")
+                value = str(value)
+                if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                    raise RuntimeError("所选供应商的自定义请求头无效，请在 AstrBot 供应商设置中检查。")
+                if name.lower() == "user-agent":
+                    if value.strip() and not self._str_cfg("api", "user_agent", "").strip():
+                        headers["User-Agent"] = value
+                else:
+                    for old_name in list(headers):
+                        if old_name.lower() == name.lower():
+                            del headers[old_name]
+                    headers[name] = value
         if content_type:
             headers["Content-Type"] = content_type
 
@@ -5083,41 +5465,11 @@ class GPTImage2Plugin(Star):
         configured = self._str_cfg("api", "user_agent", "").strip()
         return configured or DEFAULT_USER_AGENT
 
-    def _api_key(self) -> str:
-        # New unified ``api`` block first. The same section name was used by
-        # the very old pre-split config, so super-old users keep working too.
-        new_key = self._str_cfg("api", "api_key", "")
-        if new_key:
-            return new_key
+    def _api_key(self, *, advanced: bool = False) -> str:
+        return self._resolve_image_api_connection(advanced=advanced)["api_key"]
 
-        # Legacy fallback only applies when the user is still on the old
-        # blocks. Once they have customized the new ``api`` block (e.g. a
-        # custom ``base_url``) and intentionally left ``api.api_key`` empty
-        # to use an environment variable, a stale leftover key in the old
-        # ``openai`` / ``two_api`` block must NOT silently be sent to the
-        # new endpoint. ``_new_api_active`` already encapsulates this check.
-        if not self._new_api_active():
-            legacy_key = self._legacy_lookup("api_key")
-            if legacy_key:
-                return legacy_key
-
-        # Last resort: environment variables. Order depends on which legacy
-        # section the user was on so old 2api-mode users keep getting
-        # ``TWO_API_KEY`` first when both vars happen to be set.
-        if self._legacy_preferred_section() == "two_api":
-            return os.environ.get("TWO_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
-        return os.environ.get("OPENAI_API_KEY", "") or os.environ.get("TWO_API_KEY", "")
-
-    def _ensure_enabled(self) -> None:
-        # ``_api_key`` already walks the new ``api`` block, the legacy
-        # ``openai`` / ``two_api`` blocks (honoring their ``enabled`` flags),
-        # and the environment variables. An empty result means nothing usable
-        # is configured anywhere.
-        if not self._api_key():
-            raise RuntimeError(
-                "图像接口没有配置 API Key。"
-                "请在插件配置里填写 api.api_key，或设置环境变量 OPENAI_API_KEY / TWO_API_KEY。"
-            )
+    def _ensure_enabled(self, *, advanced: bool = False) -> None:
+        self._resolve_image_api_connection(advanced=advanced)
 
     def _cleanup_old_images(self) -> None:
         ttl_hours = self._int_cfg("runtime", "cache_ttl_hours", 72)

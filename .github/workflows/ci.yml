@@ -21,3 +21,6 @@ jobs:
 
       - name: Validate plugin configuration JSON
         run: python3 -m json.tool _conf_schema.json > /dev/null
+
+      - name: Validate public release contracts
+        run: python3 -m unittest discover -s tests -v

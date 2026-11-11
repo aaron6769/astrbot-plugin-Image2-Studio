@@ -1,410 +1,110 @@
 {
   "api": {
-    "description": "API 接入设置",
-    "type": "object",
-    "hint": "兼容 OpenAI 官方 Images API、标准 OpenAI-compatible 接口，以及网页逆向/2api/ToAPIs 渠道。不确定供应商类型也可以直接填写，插件会自动选择合适的参数格式并在参数错误时切换重试。",
+    "description": "模型选择", "type": "object",
+    "hint": "在 AstrBot 配好支持 Images 接口的模型，再在这里选择。自动复用地址、密钥和请求头；其余参数已有推荐默认值。",
     "items": {
-      "api_key": {
-        "description": "API Key",
-        "type": "string",
-        "default": "",
-        "hint": "供应商提供的 API Key。留空时按 OPENAI_API_KEY、TWO_API_KEY 环境变量回退读取。"
-      },
-      "base_url": {
-        "description": "Base URL",
-        "type": "string",
-        "default": "https://api.openai.com/v1",
-        "hint": "填到 /v1 即可，例如 https://api.openai.com/v1。插件会自动补 /images/generations 或 /images/edits。"
-      },
-      "model": {
-        "description": "模型名",
-        "type": "string",
-        "default": "gpt-image-2",
-        "hint": "按你的供应商要求填写，例如 gpt-image-2、gpt-image-2-all、gpt-image-1.5-official。"
-      },
-      "timeout_seconds": {
-        "description": "请求超时秒数",
-        "type": "int",
-        "default": 180,
-        "hint": "图像生成可能较慢，建议 120-300 秒。"
-      },
-      "user_agent": {
-        "description": "自定义 User-Agent",
-        "type": "string",
-        "default": "",
-        "hint": "留空使用插件默认 UA（避开 Cloudflare 默认拦截 Python/aiohttp 的规则）。如果你的中转要求特定 UA 才能访问，在这里覆盖；多数用户不用动。"
-      }
+      "normal_provider_id": {"description": "普通画图模型", "type": "string", "default": "", "_special": "select_provider", "hint": "必选，用于自然对话、自拍、/生图和/改图。请选择生图模型；停用或删除后会提示错误，不自动切换。"},
+      "advanced_provider_id": {"description": "高级画图模型（/plan）", "type": "string", "default": "", "_special": "select_provider", "hint": "使用 /plan 时选择，可与普通画图相同。不使用 /plan 可留空；不会自动回退到其他模型。"},
+      "show_connection_options": {"description": "显示连接设置", "type": "bool", "default": false, "hint": "通常不用改；仅控制显示，隐藏后已有值仍生效。"},
+      "timeout_seconds": {"description": "生成超时", "type": "int", "default": 300, "options": [120, 180, 300, 600, 900], "labels": ["2 分钟", "3 分钟", "5 分钟（推荐）", "10 分钟", "15 分钟"], "condition": {"show_connection_options": true}, "hint": "超时不代表上游没有生成，请先核对再重试。"},
+      "user_agent": {"description": "自定义 User-Agent", "type": "string", "default": "", "condition": {"show_connection_options": true}, "hint": "留空使用插件默认值，只有供应商明确要求时才填写。"}
     }
   },
   "image": {
-    "description": "图片参数",
-    "type": "object",
-    "hint": "size 是实际像素尺寸，resolution 只保留 1k/2k 清晰度档位，aspect_ratio 是画面比例。当前上游实测 4K 需要使用 size=3840x2160 或 2160x3840。",
+    "description": "图片参数", "type": "object",
+    "hint": "静态图片的默认值，命令或对话可覆盖。尺寸优先于比例和清晰度，GIF 使用独立尺寸。",
     "items": {
-      "size": {
-        "description": "默认像素尺寸",
-        "type": "string",
-        "default": "auto",
+      "size": {"description": "图片尺寸", "type": "string", "default": "auto",
         "options": ["auto", "1024x1024", "1536x1024", "1024x1536", "2560x1440", "1440x2560", "2880x2880", "3840x2160", "2160x3840"],
-        "hint": "宽x高像素。官方标准档：1024x1024、1536x1024、1024x1536；当前上游实测可用扩展档：2560x1440、1440x2560、2880x2880、3840x2160、2160x3840。3840x3840 和 4096x4096 已实测不支持。"
-      },
-      "resolution": {
-        "description": "默认分辨率",
-        "type": "string",
-        "default": "1k",
-        "options": ["auto", "1k", "2k"],
-        "hint": "GPT 图像模型的清晰度档位。当前上游实测 resolution=4k 不会稳定返回真实 4K；需要 4K 请改用默认像素尺寸 3840x2160 或 2160x3840。"
-      },
-      "aspect_ratio": {
-        "description": "默认比例",
-        "type": "string",
-        "default": "auto",
+        "labels": ["自动（推荐）", "正方形 · 1024 × 1024", "横图 · 1536 × 1024", "竖图 · 1024 × 1536", "2K 横图 · 2560 × 1440", "2K 竖图 · 1440 × 2560", "大正方形 · 2880 × 2880", "4K 横图 · 3840 × 2160", "4K 竖图 · 2160 × 3840"],
+        "hint": "不确定时选自动。大尺寸依赖模型与供应商支持，通常更慢、费用更高。"},
+      "aspect_ratio": {"description": "画面比例", "type": "string", "default": "auto",
         "options": ["auto", "1:1", "3:2", "2:3", "4:3", "3:4", "5:4", "4:5", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21"],
-        "hint": "画面比例。支持比例参数的兼容站会按比例出图；OpenAI 官方接口会近似映射为方图、横图或竖图。改图没传比例时优先跟随第一张参考图比例。"
-      },
-      "quality": {
-        "description": "默认质量",
-        "type": "string",
-        "default": "auto",
-        "options": ["auto", "low", "medium", "high"],
-        "hint": "日常建议 auto。需要精细成品图时可选 high。"
-      },
-      "output_format": {
-        "description": "输出格式",
-        "type": "string",
-        "default": "png",
-        "options": ["png", "jpeg", "webp"],
-        "hint": "透明背景建议使用 png 或 webp。"
-      },
-      "background": {
-        "description": "背景",
-        "type": "string",
-        "default": "auto",
-        "options": ["auto", "transparent", "opaque"],
-        "hint": "transparent 用于透明背景。供应商如果不支持该字段，可能会忽略或报错。"
-      },
-      "max_reference_images": {
-        "description": "最多参考图数量",
-        "type": "int",
-        "default": 16,
-        "slider": {"min": 1, "max": 16, "step": 1},
-        "hint": "GPT 图像编辑接口最多支持 16 张参考图，插件会自动截断到这个上限。"
-      }
+        "labels": ["自动（推荐）", "1:1 · 正方形", "3:2 · 横图", "2:3 · 竖图", "4:3 · 横图", "3:4 · 竖图", "5:4 · 横图", "4:5 · 竖图", "16:9 · 宽屏", "9:16 · 手机竖屏", "2:1 · 宽横图", "1:2 · 长竖图", "21:9 · 超宽屏", "9:21 · 超长竖图"],
+        "hint": "尺寸为自动时使用。改图默认跟随参考图；部分接口映射为接近的支持尺寸。"},
+      "resolution": {"description": "清晰度档位", "type": "string", "default": "auto", "options": ["auto", "1k", "2k"], "labels": ["自动（推荐）", "1K · 日常", "2K · 更清晰"], "hint": "仅部分兼容接口支持。需要确定像素时直接选择图片尺寸。"},
+      "quality": {"description": "生成质量", "type": "string", "default": "auto", "options": ["auto", "low", "medium", "high"], "labels": ["自动（推荐）", "低 · 更快", "中 · 均衡", "高 · 更多细节"], "hint": "高质量通常更慢、费用更高；GIF 也使用此默认质量。"},
+      "output_format": {"description": "默认输出格式", "type": "string", "default": "png", "options": ["png", "jpeg", "webp", "gif"], "labels": ["PNG（推荐）", "JPEG · 静态", "WebP · 静态", "GIF · 默认动图（需启用开关）"], "hint": "建议保持 PNG，需要动图时明确说生成 GIF 或使用 --format gif。选择 GIF 会让未指定格式的画图默认出动图。"},
+      "background": {"description": "背景", "type": "string", "default": "auto", "options": ["auto", "opaque", "transparent"], "labels": ["自动（推荐）", "不透明", "透明（PNG / WebP）"], "hint": "不确定时选自动。透明背景建议使用 PNG 或 WebP，并确认供应商支持；透明 JPEG 会自动改为 PNG。"},
+      "max_reference_images": {"description": "最多参考图", "type": "int", "default": 16, "options": [1, 2, 4, 8, 16], "labels": ["1 张", "2 张", "4 张", "8 张", "16 张（默认上限）"], "hint": "只读取当前消息或明确引用的图片，不自动沿用历史图片。"},
+      "gif_frame_count": {"description": "旧版 GIF 帧数（升级兼容）", "type": "int", "default": 9, "invisible": true},
+      "gif_frame_duration_ms": {"description": "旧版 GIF 时长（升级兼容）", "type": "int", "default": 200, "invisible": true}
     }
   },
-  "prompt": {
-    "description": "提示词处理",
-    "type": "object",
-    "hint": "可选。给所有生成/改图请求统一追加提示词。",
+  "gif": {
+    "description": "GIF 动图", "type": "object", "obvious_hint": true,
+    "hint": "仅限已开放 GIF 能力的官方 API 源（含完整透传的中转）。网页逆向源未必支持原生动画，模型名相同不代表可用；中转还必须保留 output_format、frame_count 和 frame_duration_ms，否则会报错或丢失帧设置。",
     "items": {
-      "prompt_prefix": {
-        "description": "统一前缀",
-        "type": "string",
-        "default": "",
-        "hint": "会放在用户提示词前面。"
-      },
-      "prompt_suffix": {
-        "description": "统一后缀",
-        "type": "string",
-        "default": "",
-        "hint": "会放在用户提示词后面。"
-      },
-      "negative_prompt": {
-        "description": "避免内容",
-        "type": "string",
-        "default": "",
-        "hint": "图像接口没有独立 negative prompt，本插件会把它追加成 Avoid: ...。"
-      },
-      "translate_to_english": {
-        "description": "上传前转英文",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，插件会在真正调用图片接口前，把最终提示词翻译/改写成英文再上传。中文增强模板仍可照常使用。"
-      },
-      "translation_provider_id": {
-        "description": "英文化模型",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "可选。留空时使用当前默认对话模型。建议选择稳定的文本对话模型，不需要视觉模型。"
-      },
-      "translation_template": {
-        "description": "英文化提示词模板",
-        "type": "string",
-        "default": "You are an image prompt localization and rewriting assistant.\n\nTask:\nRewrite the following final image prompt into clear, natural English suitable for an image generation model.\n\nFinal image prompt:\n{prompt}\n\nRequirements:\n1. Output only the final English image prompt. Do not explain, do not use Markdown, and do not wrap it in quotes.\n2. Preserve every concrete visual requirement, composition constraint, style, subject identity, clothing, expression, pose, background, lighting, and negative constraint.\n3. If the prompt asks the image to contain specific visible text, keep that visible text exactly in its original language and make it clear that the text should appear in the image.\n4. Do not add new characters, logos, watermarks, captions, or story elements.\n5. Keep safety and modesty constraints explicit if they are present.",
-        "hint": "可用变量：{prompt} 表示插件已经整理完成、即将上传给图片接口的最终提示词。"
-      },
-      "translation_timeout_seconds": {
-        "description": "英文化超时秒数",
-        "type": "int",
-        "default": 45,
-        "hint": "提示词英文化阶段的模型请求超时。"
-      },
-      "translation_max_output_chars": {
-        "description": "英文提示词最大字符数",
-        "type": "int",
-        "default": 4000,
-        "hint": "英文提示词过长时会截断，避免提交给图片接口的 prompt 过大。"
-      },
-      "translation_fallback_to_original": {
-        "description": "英文化失败时回退原文",
-        "type": "bool",
-        "default": false,
-        "hint": "关闭时，英文化失败会直接报错，不会把中文 prompt 上传给图片接口；开启时会继续使用原提示词。"
-      }
+      "enabled": {"description": "启用 GIF 功能", "type": "bool", "default": false, "hint": "默认关闭。确认官方 API 源和中转支持后再开；开启不改变 PNG 默认格式。目前仅支持文字生成 GIF，不支持参考图改动图。"},
+      "frame_count": {"description": "默认帧数", "type": "int", "default": 9, "condition": {"enabled": true},
+        "options": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        "labels": ["2 帧", "3 帧", "4 帧 · 快速测试", "5 帧", "6 帧", "7 帧", "8 帧", "9 帧（推荐）", "10 帧", "11 帧", "12 帧", "13 帧", "14 帧", "15 帧", "16 帧"],
+        "hint": "允许 2–16 帧，帧数越多通常开销越大；可用 --frames 临时覆盖。"},
+      "frame_duration_ms": {"description": "播放速度", "type": "int", "default": 200, "condition": {"enabled": true},
+        "options": [20, 40, 50, 80, 100, 120, 160, 200, 250, 300, 400, 500, 750, 1000, 1500, 2000],
+        "labels": ["20 毫秒 / 帧 · 极快", "40 毫秒 / 帧", "50 毫秒 / 帧 · 快", "80 毫秒 / 帧", "100 毫秒 / 帧", "120 毫秒 / 帧", "160 毫秒 / 帧", "200 毫秒 / 帧（推荐）", "250 毫秒 / 帧", "300 毫秒 / 帧", "400 毫秒 / 帧", "500 毫秒 / 帧 · 慢", "750 毫秒 / 帧", "1 秒 / 帧", "1.5 秒 / 帧", "2 秒 / 帧 · 很慢"],
+        "hint": "数值越小越快，默认每轮约 1.8 秒。命令 --frame-ms 可设 20–2000 毫秒，按 10 毫秒取整。"},
+      "size": {"description": "动图尺寸（每帧）", "type": "string", "default": "auto", "condition": {"enabled": true}, "options": ["auto", "256x256", "512x512", "768x512", "512x768"], "labels": ["自动（推荐）", "256 × 256 · 小表情", "512 × 512 · 正方形", "768 × 512 · 横图", "512 × 768 · 竖图"], "hint": "与静态图独立。模型限制每帧尺寸及总像素预算，不支持时请选择自动或减少帧数。"}
     }
   },
-  "self_persona": {
-    "description": "自拍/人设生图",
-    "type": "object",
-    "hint": "识别到“你、你的、自己、自拍、全身照、本体、形象”等纯文字生图请求时，优先使用这里配置的生图人设生成最终提示词。适合固定 bot 的自拍和形象图，不受 AstrBot 对话人设改动影响。",
+  "show_advanced": {"description": "显示高级设置", "type": "bool", "default": false, "hint": "需要调整 /plan、提示词、并发或缓存时再展开。只控制显示，不会禁用或重置已有设置。"},
+  "plan": {
+    "description": "高级画图 /plan", "type": "object", "condition": {"show_advanced": true},
+    "hint": "先整理需求，再用 /plan confirm 确认出图。默认跟随当前对话模型整理，生图使用上方高级画图模型。",
     "items": {
-      "enable": {
-        "description": "启用插件内生图人设",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，自拍/本体/你的形象这类请求会使用插件内人设改写提示词。"
-      },
-      "provider_id": {
-        "description": "人设提示词改写模型",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "可选。留空则使用当前会话默认对话模型；填写后会使用指定 Provider ID 来把插件内人设和用户请求改写成最终图像提示词。"
-      },
-      "persona_name": {
-        "description": "生图人设名称",
-        "type": "string",
-        "default": "",
-        "hint": "例如 Neuro-sama、工具人、看板娘等。留空但填写了视觉设定时，会使用“插件内生图人设”。"
-      },
-      "persona_prompt": {
-        "description": "生图人设/视觉设定",
-        "type": "string",
-        "default": "",
-        "hint": "固定自拍和本体形象的核心配置。建议写清楚发色、瞳色、服装、年龄感、气质、常见场景、禁止出现的元素等。"
-      },
-      "fallback_to_astrbot_persona": {
-        "description": "未填写时回退 AstrBot 人设",
-        "type": "bool",
-        "default": true,
-        "hint": "插件内人设名称和视觉设定都为空时，是否继续使用当前 AstrBot 对话人设。关闭后会只按用户请求做通用视觉化。"
-      },
-      "prompt_template": {
-        "description": "人设提示词改写模板",
-        "type": "string",
-        "default": "你是图像生成提示词改写器。用户正在让当前 bot 根据插件内配置的人设生成图像。\n\n插件内人设名称：\n{persona_name}\n\n插件内人设/视觉设定：\n{persona_prompt}\n\n用户原始生图请求：\n{user_prompt}\n\n请把用户请求改写成一段可以直接提交给图像生成模型的中文提示词。\n\n要求：\n1. 必须根据“插件内人设/视觉设定”提炼 bot 的可视化形象、气质、服装、表情、姿态和画面氛围。\n2. 如果用户说“你、你的、自己、自拍、全身照、本体、形象”等，指的就是插件内配置的 bot 形象。\n3. 保留用户请求里的画幅、视角、动作、风格、数量和限制。\n4. 如果人设没有明确外貌，请根据设定气质做合理视觉化，但不要加入无关角色、文字、logo、水印或剧情。\n5. 只输出最终图像提示词，不要解释，不要 Markdown，不要代码块。",
-        "hint": "可用变量：{persona_name} 生图人设名称，{persona_prompt} 生图人设/视觉设定，{user_prompt} 用户原始生图请求。"
-      },
-      "timeout_seconds": {
-        "description": "改写模型超时秒数",
-        "type": "int",
-        "default": 45,
-        "hint": "自拍/人设生图提示词改写阶段的请求超时。留意这不是图像生成接口超时。"
-      },
-      "max_output_chars": {
-        "description": "人设提示词最大字符数",
-        "type": "int",
-        "default": 4000,
-        "hint": "改写模型输出过长时会截断，避免提交给图片接口的 prompt 过大。"
-      }
+      "enable_model_planning": {"description": "用模型整理需求", "type": "bool", "default": true, "hint": "关闭后只记录原始需求；预览与实际提交使用同一份最终提示词。"},
+      "provider_id": {"description": "需求整理模型", "type": "string", "default": "", "_special": "select_provider", "condition": {"enable_model_planning": true}, "hint": "留空跟随当前对话模型，带参考图时需支持视觉。"},
+      "max_reference_images": {"description": "整理阶段读取图片数", "type": "int", "default": 4, "options": [0, 1, 2, 4, 8, 16], "labels": ["不读取图片", "1 张", "2 张", "4 张（推荐）", "8 张", "16 张"], "condition": {"enable_model_planning": true}},
+      "timeout_seconds": {"description": "整理超时", "type": "int", "default": 60, "options": [30, 60, 120, 180], "labels": ["30 秒", "1 分钟（推荐）", "2 分钟", "3 分钟"], "condition": {"enable_model_planning": true}},
+      "max_output_chars": {"description": "整理稿长度上限", "type": "int", "default": 5000, "options": [2000, 4000, 5000, 8000, 12000], "labels": ["2000 字符", "4000 字符", "5000 字符（推荐）", "8000 字符", "12000 字符"], "condition": {"enable_model_planning": true}},
+      "session_ttl_seconds": {"description": "计划闲置保留时间", "type": "int", "default": 900, "options": [300, 900, 1800, 3600, 0], "labels": ["5 分钟", "15 分钟（推荐）", "30 分钟", "1 小时", "不自动过期"]},
+      "prompt_template": {"description": "自定义整理模板", "type": "text", "default": "", "condition": {"enable_model_planning": true}, "hint": "通常留空，使用内置模板。变量：{raw_prompt}、{latest_prompt}、{previous_plan}、{options}、{reference_count}。"}
     }
   },
   "prompt_enhance": {
-    "description": "参考图提示词增强",
-    "type": "object",
-    "hint": "可选。占位符模式会使用“完整提示词增强模板”生成最终提示词，并要求增强模型把占位符替换为用户本次真实需求；如果模型遗留占位符，插件会用用户原始请求兜底替换。",
+    "description": "参考图提示词增强", "type": "object", "condition": {"show_advanced": true},
+    "hint": "默认关闭，开启会增加模型调用。自然对话中无参考图的画图和自拍始终由当前 LLM 按人设组织提示词。",
     "items": {
-      "enable": {
-        "description": "启用提示词增强",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，插件会在真正提交图片生成/编辑前，先调用下面配置的模型生成最终提示词。"
-      },
-      "provider_id": {
-        "description": "提示词增强模型",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "填写一个支持视觉输入的模型 Provider ID，例如 本机反代/gpt-5.5。留空则使用当前默认对话模型。"
-      },
-      "use_global_image_caption_provider": {
-        "description": "Provider ID 留空时使用全局图片描述模型",
-        "type": "bool",
-        "default": true,
-        "hint": "仅影响 GPT Image 插件。提示词增强模型 Provider ID 留空时，优先读取 AstrBot 全局配置里的 default_image_caption_provider_id；仍为空时再使用当前默认对话模型。不会修改 stealer 插件。"
-      },
-      "mode": {
-        "description": "增强模式",
-        "type": "string",
-        "default": "placeholder",
-        "options": ["placeholder", "full_prompt"],
-        "hint": "placeholder：使用“完整提示词增强模板”，让增强模型把占位符替换为用户本次需求并输出最终提示词；full_prompt：直接让增强模型输出最终提示词，不做占位符兜底替换。"
-      },
-      "apply_to": {
-        "description": "应用范围",
-        "type": "string",
-        "default": "edit_only",
-        "options": ["edit_only", "all"],
-        "hint": "edit_only 只在有参考图的改图请求中启用；all 会对纯文字生图也调用模型改写提示词。"
-      },
-      "placeholder": {
-        "description": "主体内容占位符",
-        "type": "string",
-        "default": "[在此处替换为您想要生成的主体内容]",
-        "hint": "在“完整提示词增强模板”中预留的主体/目标描述位置。placeholder 模式下最终提交前不应再保留这个占位符。"
-      },
-      "final_prompt_template": {
-        "description": "固定绘图母版（旧版保留）",
-        "type": "string",
-        "default": "Edit the provided reference image. Treat the reference image as the image to modify, not just as style inspiration.\n\nReplace only the requested main subject/person/foreground character with:\n[在此处替换为您想要生成的主体内容]\n\nHard constraints:\n- Preserve the original composition, camera angle, framing, perspective, aspect ratio, background, lighting direction, atmosphere, depth of field, and overall layout as much as possible.\n- Keep all non-target objects, scenery, background figures, readable text, logos, signs, UI, and environmental details unchanged unless the user explicitly asks to change them.\n- If the reference image contains text and the user asks to keep text, keep the text clear, readable, and in the same approximate position.\n- Remove or transform the original target subject; do not leave the old subject visible as an extra character.\n- Do not add new watermarks, captions, random text, extra characters, or unrelated story elements.\n- The result should look like a local edit of the provided image rather than a completely new image.",
-        "hint": "旧版主体提取流程使用的固定母版。当前 placeholder 模式已改为使用“完整提示词增强模板”，这里保留是为了兼容旧配置。"
-      },
-      "subject_prompt_template": {
-        "description": "主体内容提取提示词（旧版保留）",
-        "type": "string",
-        "default": "你是图像编辑需求提取器。请根据用户原始消息、工具改写提示词和参考图片，提取一段应该填入固定绘图母版占位符里的“主体/目标内容”。\n\n用户原始消息：\n{raw_user_prompt}\n\n工具改写提示词：\n{user_prompt}\n\n工具传入的额外风格参数：\n{style}\n\n参考图片数量：\n{image_count}\n\n请遵守：\n1. 只输出要填入占位符的主体/目标描述，不要输出完整绘图提示词。\n2. 如果用户要求“替换/换成/改成某人物或主体”，重点描述新主体的身份、外观、服装、姿态、表情、风格和必须出现的标志性元素。\n3. 如果用户要求保留文字、保留构图、保留背景或保留姿势，请把这些和主体相关的硬要求简洁写入描述。\n4. 不要编造用户没有要求的新文字、logo、水印、剧情或额外角色。\n5. 不要解释，不要 Markdown，不要代码块。",
-        "hint": "旧版主体提取流程使用。当前 placeholder 模式不再读取这个字段，请把主控提示词写在“完整提示词增强模板”里。"
-      },
-      "prompt_template": {
-        "description": "完整提示词增强模板",
-        "type": "string",
-        "default": "你是图像生成提示词工程师。请根据用户需求和参考图片，输出一段适合 GPT Image 图像编辑/生成接口使用的最终提示词。\n\n用户原始需求：\n{user_prompt}\n\n工具传入的额外风格参数：\n{style}\n\n参考图片数量：\n{image_count}\n\n请遵守：\n1. 先准确理解参考图主体、构图、画面关系、颜色、材质、表情、动作和重要细节。\n2. 如果参考图中有文字，请逐字列出文字内容，并说明大概位置；用户要求保留文字时，必须在最终提示词里强调文字清晰可读、内容和位置尽量保持一致。\n3. 如果用户要求重绘、转画风或改图，请明确哪些元素需要保留，哪些元素需要改变。\n4. 把用户要求转写成完整、具体、可独立理解的图像提示词，适合直接提交给图片生成模型。\n5. 不要新增用户没有要求的主体、文字、logo、水印或剧情。\n6. 只输出最终提示词，不要解释，不要 Markdown，不要代码块。",
-        "hint": "placeholder 和 full_prompt 模式都会使用。placeholder 模式下，如果模板中包含占位符，增强模型会被要求把它替换为用户本次需求，并且插件会做兜底替换。可用变量：{raw_user_prompt} 用户原始消息，{user_prompt} 工具改写提示词，{style} 风格参数，{image_count} 参考图数量。"
-      },
-      "max_reference_images": {
-        "description": "增强模型最多读取参考图数",
-        "type": "int",
-        "default": 1,
-        "slider": {"min": 0, "max": 16, "step": 1},
-        "hint": "提示词增强阶段最多把多少张参考图发给视觉模型。0 表示只用文字需求改写，不发送图片。"
-      },
-      "timeout_seconds": {
-        "description": "增强模型超时秒数",
-        "type": "int",
-        "default": 60,
-        "hint": "提示词增强模型的请求超时时间。图片理解模型较慢时可调高。"
-      },
-      "max_output_chars": {
-        "description": "增强提示词最大字符数",
-        "type": "int",
-        "default": 4000,
-        "hint": "增强模型输出过长时会截断，避免提交给图片接口的 prompt 过大。"
-      },
-      "fallback_to_original_prompt": {
-        "description": "增强失败时回退原提示词",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，如果提示词增强模型失败，仍会用原始提示词继续生成；关闭则直接报错。"
-      }
+      "enable": {"description": "启用提示词增强", "type": "bool", "default": false},
+      "provider_id": {"description": "增强模型", "type": "string", "default": "", "_special": "select_provider", "condition": {"enable": true}, "hint": "选择支持视觉的模型；留空使用全局图片描述模型或当前对话模型。"},
+      "use_global_image_caption_provider": {"description": "留空时优先用全局图片描述模型", "type": "bool", "default": true, "condition": {"enable": true}, "hint": "全局未指定时跟随当前对话模型；关闭则直接跟随当前对话模型。"},
+      "mode": {"description": "增强方式", "type": "string", "default": "placeholder", "options": ["placeholder", "full_prompt"], "labels": ["模板补全（推荐）", "完整重写"], "condition": {"enable": true}},
+      "apply_to": {"description": "应用范围", "type": "string", "default": "edit_only", "options": ["edit_only", "all"], "labels": ["仅参考图编辑（推荐）", "参考图编辑和显式画图命令"], "condition": {"enable": true}, "hint": "不会二次改写当前 LLM 无参考图的工具提示词。"},
+      "placeholder": {"description": "模板占位符", "type": "string", "default": "[在此处替换为您想要生成的主体内容]", "condition": {"enable": true, "mode": "placeholder"}},
+      "prompt_template": {"description": "自定义增强模板", "type": "text", "default": "", "condition": {"enable": true}, "hint": "通常留空，使用内置模板。变量：{raw_user_prompt}、{user_prompt}、{style}、{image_count}。"},
+      "max_reference_images": {"description": "增强阶段读取图片数", "type": "int", "default": 1, "options": [0, 1, 2, 4, 8, 16], "labels": ["不读取图片", "1 张（推荐）", "2 张", "4 张", "8 张", "16 张"], "condition": {"enable": true}},
+      "timeout_seconds": {"description": "增强超时", "type": "int", "default": 60, "options": [30, 60, 120, 180], "labels": ["30 秒", "1 分钟（推荐）", "2 分钟", "3 分钟"], "condition": {"enable": true}},
+      "max_output_chars": {"description": "增强提示词长度上限", "type": "int", "default": 4000, "options": [2000, 4000, 8000, 12000], "labels": ["2000 字符", "4000 字符（推荐）", "8000 字符", "12000 字符"], "condition": {"enable": true}},
+      "fallback_to_original_prompt": {"description": "增强失败时使用原文", "type": "bool", "default": true, "condition": {"enable": true}}
     }
   },
-  "plan": {
-    "description": "高级画图 Plan 模式",
-    "type": "object",
-    "hint": "/plan 阶段会先调用模型整理图像需求并回复确认稿；/plan confirm 才正式生成图片。",
+  "prompt": {
+    "description": "提示词与翻译", "type": "object", "condition": {"show_advanced": true},
+    "hint": "默认无需修改。仅用于显式命令和参考图编辑；当前 LLM 无参考图的工具提示词不套用这里的模板。",
     "items": {
-      "enable_model_planning": {
-        "description": "启用模型整理",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，/plan 会先调用文本/视觉模型整理图像需求和最终提示词。关闭后只做本地记录。"
-      },
-      "provider_id": {
-        "description": "Plan 模型",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "可选。留空时使用当前默认对话模型。带参考图的 Plan 建议选择支持视觉输入的模型。"
-      },
-      "max_reference_images": {
-        "description": "Plan 阶段最多读取参考图数",
-        "type": "int",
-        "default": 4,
-        "slider": {"min": 0, "max": 16, "step": 1},
-        "hint": "仅影响 /plan 整理需求时发送给规划模型的参考图数量；正式生成仍按图片参数里的最多参考图数量。"
-      },
-      "timeout_seconds": {
-        "description": "Plan 模型超时秒数",
-        "type": "int",
-        "default": 60,
-        "hint": "规划模型的请求超时时间。带图理解较慢时可调高。"
-      },
-      "max_output_chars": {
-        "description": "Plan 输出最大字符数",
-        "type": "int",
-        "default": 5000,
-        "hint": "整理稿过长时会截断，避免消息和流程记录过大。"
-      },
-      "session_ttl_seconds": {
-        "description": "Plan 会话闲置超时秒数",
-        "type": "int",
-        "default": 900,
-        "hint": "同一个会话超过该时间没有继续 /plan、/plan status 或 /plan confirm，会自动退出。0 表示不自动过期。"
-      },
-      "prompt_template": {
-        "description": "Plan 整理模板",
-        "type": "string",
-        "default": "",
-        "hint": "可选。留空使用插件内置模板。可用变量：{raw_prompt} 累计需求，{latest_prompt} 本次追加，{previous_plan} 上一版整理稿，{options} 参数，{reference_count} 参考图数量。"
-      }
+      "prompt_prefix": {"description": "统一前缀", "type": "text", "default": "", "hint": "可选，放在命令提示词前面。"},
+      "prompt_suffix": {"description": "统一后缀", "type": "text", "default": "", "hint": "可选，放在命令提示词后面。"},
+      "negative_prompt": {"description": "避免的内容", "type": "text", "default": "", "hint": "可选，作为文字要求追加，不是独立接口参数。"},
+      "translate_to_english": {"description": "提交前转为英文", "type": "bool", "default": false, "hint": "通常不需要，开启会增加一次模型调用。"},
+      "translation_provider_id": {"description": "翻译模型", "type": "string", "default": "", "_special": "select_provider", "condition": {"translate_to_english": true}, "hint": "留空跟随当前对话模型。"},
+      "translation_template": {"description": "自定义翻译模板", "type": "text", "default": "", "condition": {"translate_to_english": true}, "hint": "通常留空，使用内置模板。{prompt} 为最终图片提示词。"},
+      "translation_timeout_seconds": {"description": "翻译超时", "type": "int", "default": 45, "options": [30, 45, 60, 120], "labels": ["30 秒", "45 秒（推荐）", "1 分钟", "2 分钟"], "condition": {"translate_to_english": true}},
+      "translation_max_output_chars": {"description": "翻译长度上限", "type": "int", "default": 4000, "options": [2000, 4000, 8000, 12000], "labels": ["2000 字符", "4000 字符（推荐）", "8000 字符", "12000 字符"], "condition": {"translate_to_english": true}},
+      "translation_fallback_to_original": {"description": "翻译失败时使用原文", "type": "bool", "default": false, "condition": {"translate_to_english": true}, "hint": "默认停止并提示。Plan 准备失败始终停止，防止预览与提交不一致。"}
     }
   },
   "runtime": {
-    "description": "运行设置",
-    "type": "object",
-    "hint": "函数工具和工具说明默认启用；如需禁用工具，请在 AstrBot 自带的函数工具开关里关闭 generate_image_with_gpt_image_2。",
+    "description": "性能与缓存", "type": "object", "condition": {"show_advanced": true},
+    "hint": "保守默认值适合首次使用。自然语言画图依赖 AstrBot 函数工具；需要停用时请在 AstrBot 工具管理中关闭。",
     "items": {
-      "llm_tool_foreground_wait_seconds": {
-        "description": "LLM 工具前台等待秒数",
-        "type": "int",
-        "default": 0,
-        "hint": "0 表示工具立刻返回短句给模型，让模型按自己人设告诉用户；生成完成后自动发图。"
-      },
-      "enable_direct_keyword_trigger": {
-        "description": "启用关键词直接触发",
-        "type": "bool",
-        "default": false,
-        "hint": "关闭后，自然语言生图/改图只由对话模型决定是否调用 Image2 工具；/生图、/改图、/plan 命令不受影响。建议保持关闭，避免关键词误触发。"
-      },
-      "max_concurrent": {
-        "description": "图片生成并行数",
-        "type": "int",
-        "default": 1,
-        "hint": "同一时间最多允许多少个图片请求同时跑。默认 1，后续任务会排队；调高会更吃接口额度和带宽。"
-      },
-      "retry_times": {
-        "description": "网络抖动重试次数",
-        "type": "int",
-        "default": 1,
-        "slider": {"min": 0, "max": 5, "step": 1},
-        "hint": "仅用于下载图片等无副作用请求。生成/改图是 POST 任务提交，为避免超时后重复生成或重复扣费，插件不会自动重试这类请求。"
-      },
-      "image_request_retry_times": {
-        "description": "图片接口 POST 重试次数",
-        "type": "int",
-        "default": 2,
-        "slider": {"min": 0, "max": 5, "step": 1},
-        "hint": "对图片生成和图片修改的 POST 请求，在 HTTP 502/503/504 或网络瞬断时自动重试。数值越大越稳定，但也可能造成重复生成或重复扣费。"
-      },
-      "recent_reference_ttl_seconds": {
-        "description": "最近参考图有效秒数",
-        "type": "int",
-        "default": 180,
-        "hint": "用户先单独发图、再发送“重绘成...”这类改图文字时，插件会在同一会话内沿用最近一张参考图。0 表示关闭。群聊仍必须 @bot 才会触发。"
-      },
-      "cache_ttl_hours": {
-        "description": "图片缓存保留小时数",
-        "type": "int",
-        "default": 72,
-        "hint": "生成图片会保存在插件数据目录，超过该时间会在下一次生成后清理。0 表示不按时间清理。"
-      },
-      "max_cache_files": {
-        "description": "最多缓存文件数",
-        "type": "int",
-        "default": 200,
-        "hint": "超过数量后删除最旧文件。0 表示不按数量清理。"
-      }
+      "llm_tool_foreground_wait_seconds": {"description": "对话等待方式", "type": "int", "default": 0, "options": [0, 5, 10, 20, 30, 60], "labels": ["后台生成，完成后发图（推荐）", "最多等待 5 秒", "最多等待 10 秒", "最多等待 20 秒", "最多等待 30 秒", "最多等待 1 分钟"]},
+      "enable_direct_keyword_trigger": {"description": "关键词直接触发画图", "type": "bool", "default": false, "hint": "建议关闭，由对话模型判断意图；自拍、人设和 GIF 请求仍交给当前 LLM。"},
+      "max_concurrent": {"description": "同时生成任务数", "type": "int", "default": 1, "options": [1, 2, 3, 4], "labels": ["1 个（推荐）", "2 个", "3 个", "4 个"], "hint": "其余任务排队，调高会增加供应商并发与费用压力。"},
+      "retry_times": {"description": "图片下载重试", "type": "int", "default": 1, "options": [0, 1, 2, 3, 4, 5], "labels": ["不重试", "1 次（推荐）", "2 次", "3 次", "4 次", "5 次"], "hint": "仅影响下载等读取请求，不会因此重新生图。"},
+      "image_request_retry_times": {"description": "静态图提交失败重试", "type": "int", "default": 0, "options": [0, 1, 2, 3, 4, 5], "labels": ["不自动重试（推荐）", "1 次", "2 次", "3 次", "4 次", "5 次"], "hint": "超时或网络错误后重提可能重复生成、重复扣费。GIF 始终只提交一次，不使用此设置。"},
+      "cache_ttl_hours": {"description": "图片缓存保留时间", "type": "int", "default": 72, "options": [24, 72, 168, 720, 0], "labels": ["1 天", "3 天（推荐）", "7 天", "30 天", "不按时间清理"]},
+      "max_cache_files": {"description": "缓存图片数量上限", "type": "int", "default": 200, "options": [50, 100, 200, 500, 1000, 0], "labels": ["50 张", "100 张", "200 张（推荐）", "500 张", "1000 张", "不按数量清理"]}
     }
-  }
+  },
+  "_config_version": {"description": "配置升级版本", "type": "int", "default": 0, "invisible": true}
 }
