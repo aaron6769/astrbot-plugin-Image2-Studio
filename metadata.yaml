@@ -1,7 +1,19 @@
 name: astrbot_plugin_gpt_image_2
-desc: 自然对话画图、参考图编辑、Plan 高级画图与可控 GIF；复用 AstrBot 模型配置。
 display_name: GPT Image · 龙绘
+short_desc: 自然对话生图、参考图改图与可控 GIF
+desc: |
+  直接聊天即可请求生图、参考图改图或按当前人设自拍，群聊须 @机器人。
+  普通和高级画图模型均从 AstrBot 已配置的模型中下拉选择，无需重复填写接口地址和密钥。
+  `/plan` 支持多轮整理、预览和确认后出图；流程 ID 可查询提交与发送结果。
+  可选原生 GIF 支持设置帧数和播放速度，需要上游实际支持，默认关闭。
+  由 aaron6769 维护，基于 starmiaoa 的 MIT 开源 GPT Image 插件。
 version: 1.4.1
-author: starmiaoa
+author: aaron6769
 repo: "https://github.com/aaron6769/astrbot-plugin-Image2-Studio"
 astrbot_version: ">=4.29.4"
+social_link: "https://github.com/aaron6769"
+tags:
+  - GPT Image
+  - 生图
+  - 改图
+  - GIF

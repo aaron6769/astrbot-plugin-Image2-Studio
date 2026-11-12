@@ -37,7 +37,7 @@ https://github.com/aaron6769/astrbot-plugin-Image2-Studio
 
 运行依赖在 [requirements.txt](requirements.txt) 中声明：`aiohttp` 与 `Pillow`。若安装过程中提示缺少依赖，请在 **AstrBot 实际使用的 Python 环境**中安装该文件列出的依赖，再重载插件。
 
-这是基于原插件维护的分支，内部标识仍为 `astrbot_plugin_gpt_image_2`。**不要与原版或旧版重复安装**；已有用户应更新原插件目录，并先备份配置。更换安装目录可能导致 AstrBot 使用另一份配置文件。
+这是基于原插件维护的分支，市场标识为 `aaron6769/astrbot_plugin_gpt_image_2`；包名 `astrbot_plugin_gpt_image_2` 和画图工具名称保持不变。**不要与原版或旧版重复安装**；已有用户应更新原插件目录，并先备份配置。更换安装目录可能导致 AstrBot 使用另一份配置文件。维护者命名空间不替代原代码作者署名。
 
 本仓库公开不代表已经上架 AstrBot 插件市场，目前可通过上述仓库地址安装。
 
@@ -251,7 +251,7 @@ https://github.com/aaron6769/astrbot-plugin-Image2-Studio
 
 ## 测试与维护
 
-本版本基于已在 AstrBot 4.29.4 / Python 3.12 环境通过 148 项自动化检查的 1.4.1 部署。公开包保留相同配置 schema 和图标，仅从运行代码中移除一条私人内网地址的兼容特判，并补充参数格式选择回归测试；通用自动判断与静态图参数兼容回退保留。结果不代表所有模型、供应商和聊天平台均兼容。
+本版本基于已在 AstrBot 4.29.4 / Python 3.12 环境通过 148 项自动化检查的 1.4.1 部署。公开包保留相同配置 schema 和图标，登记当前维护者，并从运行代码中移除一条私人内网地址的兼容特判；通用自动判断与静态图参数兼容回退保留。结果不代表所有模型、供应商和聊天平台均兼容。
 
 仓库 CI 提供可复现的轻量检查：Python 语法、配置 JSON、版本一致性、配置与文档契约、图标结构。它不调用收费生图接口，也不读取私人供应商配置。
 
@@ -291,4 +291,4 @@ python -m unittest discover -s tests -v
 
 本项目基于 [starmiaoa/astrbot-plugin-gpt-image](https://github.com/starmiaoa/astrbot-plugin-gpt-image) 维护，保留原作者署名和 [MIT 许可证](LICENSE)。本仓库维护者为 [aaron6769](https://github.com/aaron6769)。
 
-图标为 GPT 白龙娘的 AI 辅助同人二创，原角色设计署名 **ZipZipPipe**；不是 OpenAI、ChatGPT 或原神的官方角色或官方插件。图标、角色原设和第三方标识的使用说明见 [ARTWORK_NOTICE.md](ARTWORK_NOTICE.md)，代码许可证不自动覆盖这些素材。
+图标为 GPT 白龙娘的 AI 辅助同人二创，原角色设计署名 **ZipZipPipe**，按原作者说明仅作署名的非商业使用；不是 OpenAI、ChatGPT 或原神的官方角色或官方插件。图标、角色原设和第三方标识的使用说明见 [ARTWORK_NOTICE.md](ARTWORK_NOTICE.md)，代码许可证不自动覆盖这些素材。

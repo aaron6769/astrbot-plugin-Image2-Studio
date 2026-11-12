@@ -22,6 +22,9 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn('version: ' + version, META)
         self.assertIn('name: astrbot_plugin_gpt_image_2', META)
         self.assertIn('display_name: GPT Image · 龙绘', META)
+        author = ast.literal_eval(register.args[1])
+        self.assertEqual(author, 'aaron6769')
+        self.assertIn('author: ' + author, META.splitlines())
         self.assertIn('https://github.com/aaron6769/astrbot-plugin-Image2-Studio', META)
 
     def test_native_models_have_no_private_defaults(self):
@@ -136,7 +139,9 @@ class PublicReleaseTests(unittest.TestCase):
 
     def test_attribution_and_dependencies_are_present(self):
         self.assertIn('starmiaoa', (ROOT / 'LICENSE').read_text(encoding='utf-8'))
-        self.assertIn('ZipZipPipe', (ROOT / 'ARTWORK_NOTICE.md').read_text(encoding='utf-8'))
+        artwork = (ROOT / 'ARTWORK_NOTICE.md').read_text(encoding='utf-8')
+        self.assertIn('ZipZipPipe', artwork)
+        self.assertIn('不可商用', artwork)
         requirements = (ROOT / 'requirements.txt').read_text(encoding='utf-8')
         self.assertIn('aiohttp', requirements)
         self.assertIn('Pillow', requirements)

@@ -714,7 +714,7 @@ DEFAULT_PLAN_PROMPT_TEMPLATE = """
 
 @register(
     PLUGIN_ID,
-    "starmiaoa",
+    "aaron6769",
     "GPT Image · 龙绘：自然对话生图、改图、流程追踪与 /plan 高级画图",
     "1.4.1",
 )
